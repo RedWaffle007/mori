@@ -1,0 +1,22 @@
+# Environment variables — never commit these
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+menv/
+
+# Job data — can be large and contains scraped content
+backend/jobs/
+
+# Pipeline cache and intermediate files
+outputs/
+*.jsonl
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
