@@ -1,6 +1,6 @@
-# Step 1 — Address Validation Pipeline
+# Step 4 — Address Validation Pipeline
 
-A web app for **Step 1** of a data-enrichment pipeline. You upload an Excel file
+A web app for **Step 4** of a data-enrichment pipeline. You upload an Excel file
 of companies; the backend scrapes each company website with **ScrapeGraphAI**,
 extracts and validates **UK addresses**, and returns a downloadable validated
 Excel workbook.
@@ -106,7 +106,7 @@ python -m http.server 5500 --directory frontend
 ## Using the app
 
 1. On load, any **interrupted** jobs appear as cards with a **Resume** button.
-2. Choose an `.xlsx` file and click **Run Step 1**. The returned **job ID** is
+2. Choose an `.xlsx` file and click **Run Step 4**. The returned **job ID** is
    shown so you can note it.
 3. The page polls status every 4 seconds and shows a spinner with the current
    **per-row progress message**, e.g.:
