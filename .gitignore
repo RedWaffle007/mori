@@ -1,4 +1,4 @@
-# Environment variables — never commit these
+# Environment variables
 .env
 
 # Python
@@ -9,13 +9,16 @@ __pycache__/
 venv/
 menv/
 
-# Job data — can be large and contains scraped content
+# Job data — large scraped content and user uploads
 backend/jobs/
 
 # Pipeline cache and intermediate files
 outputs/
-*.jsonl
 *.log
+
+# Playwright browser binaries
+playwright-browsers/
+.playwright/
 
 # OS files
 .DS_Store

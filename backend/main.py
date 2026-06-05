@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
@@ -68,6 +68,15 @@ URL_CHECKPOINT = "sgai_url_checkpoint.json"  # Stage 1 per-row checkpoint (resum
 URL_STAGE1_OUTPUT = "input_sgai_urls.xlsx"   # Stage 1 output (input.xlsx stem + _sgai_urls.xlsx)
 URL_STAGE2_SUFFIX = "_promoted.xlsx"         # Stage 2 output suffix (served for download)
 
+# ── Step 2 (sector classification) artifacts ─────────────────────────────────────
+# Step 2 shares JOBS_DIR with the other steps. A hidden marker tags a job dir as a
+# Step 2 job so it reloads correctly after a restart. Batch jobs leave batch_id.txt
+# behind so an interrupted server can resume by re-checking results.
+STEP2_MARKER = ".step2"                       # marker file written when a Step 2 job is created
+STEP2_CHECKPOINT = "sgai_url_checkpoint.json" # copied from the linked Step 1 job (optional)
+STEP2_BATCH_ID = "batch_id.txt"               # written by batch submit (resume marker)
+STEP2_OUTPUT = "sector_classified.xlsx"       # final output (served for download)
+
 # Haiku 4.5 batch pricing (matches extract_addresses.py) used for cost tracking.
 _INPUT_COST_PER_TOKEN = 0.50 / 1_000_000   # $0.50 per 1 M input tokens
 _OUTPUT_COST_PER_TOKEN = 2.50 / 1_000_000  # $2.50 per 1 M output tokens
@@ -83,12 +92,14 @@ def _cost(input_tokens: int, output_tokens: int) -> float:
 @dataclass
 class JobState:
     job_id: str
-    status: str  # "queued" | "running" | "complete" | "error" | "interrupted"
+    status: str  # "queued" | "running" | "batch_submitted" | "complete" | "error" | "interrupted"
     message: str
-    step: str = "step4"  # "step4" (address validation) | "step1url" (URL discovery)
+    step: str = "step4"  # "step4" (address validation) | "step1url" (URL discovery) | "step2" (sector classification)
     output_path: Path | None = None
     error: str | None = None
     summary: dict | None = None  # results breakdown + cost tracking (set on completion)
+    mode: str | None = None  # Step 2 only: "test" | "batch"
+    batch_id: str | None = None  # Step 2 batch mode: Anthropic batch id (set after submission)
     created_at: datetime = field(default_factory=datetime.utcnow)
 
 
@@ -134,6 +145,40 @@ def _find_url_output(job_dir: Path) -> Path | None:
     return next(job_dir.glob(f"*{URL_STAGE2_SUFFIX}"), None)
 
 
+def _is_step2_job(job_dir: Path) -> bool:
+    """A job dir belongs to the Step 2 pipeline if it carries the Step 2 marker."""
+    return (job_dir / STEP2_MARKER).exists()
+
+
+def _find_step2_output(job_dir: Path) -> Path | None:
+    """Return the classified workbook if it has been produced, else None."""
+    out = job_dir / "output" / STEP2_OUTPUT
+    return out if out.exists() else None
+
+
+def _step2_summary(output_path: Path, mode: str) -> dict:
+    """Tally the four sector sheets of a completed classification workbook."""
+    xl = pd.ExcelFile(output_path)
+
+    def count(sheet: str) -> int:
+        if sheet not in xl.sheet_names:
+            return 0
+        return len(pd.read_excel(xl, sheet_name=sheet, dtype=str))
+
+    cyber = count("cyber")
+    msp = count("MSP")
+    telecom = count("telecom")
+    other = count("other")
+    return {
+        "mode": mode,
+        "rows_classified": cyber + msp + telecom + other,
+        "cyber": cyber,
+        "msp": msp,
+        "telecom": telecom,
+        "other": other,
+    }
+
+
 # ── startup: reload jobs from disk ───────────────────────────────────────────────
 
 
@@ -160,6 +205,48 @@ def _reload_url_job(job_id: str, job_dir: Path, created: datetime) -> None:
         )
 
 
+def _reload_step2_job(job_id: str, job_dir: Path, created: datetime) -> None:
+    output = _find_step2_output(job_dir)
+    batch_id_file = job_dir / STEP2_BATCH_ID
+    if output is not None:
+        # A batch_id.txt means it ran as a batch; otherwise it was a test run.
+        mode = "batch" if batch_id_file.exists() else "test"
+        try:
+            summary = _step2_summary(output, mode)
+        except Exception:  # noqa: BLE001 — summary is best-effort on reload
+            summary = None
+        jobs[job_id] = JobState(
+            job_id=job_id,
+            status="complete",
+            message="Complete",
+            step="step2",
+            mode=mode,
+            output_path=output,
+            summary=summary,
+            created_at=created,
+        )
+    elif batch_id_file.exists():
+        # Batch was submitted but no output yet → resume by re-checking results.
+        batch_id = batch_id_file.read_text(encoding="utf-8").strip()
+        jobs[job_id] = JobState(
+            job_id=job_id,
+            status="batch_submitted",
+            message=f"Batch submitted — ID: {batch_id}",
+            step="step2",
+            mode="batch",
+            batch_id=batch_id,
+            created_at=created,
+        )
+    elif (job_dir / "input.xlsx").exists():
+        jobs[job_id] = JobState(
+            job_id=job_id,
+            status="interrupted",
+            message="Interrupted — resume available",
+            step="step2",
+            created_at=created,
+        )
+
+
 def _reload_jobs() -> None:
     if not JOBS_DIR.exists():
         return
@@ -168,6 +255,12 @@ def _reload_jobs() -> None:
             continue
         job_id = job_dir.name
         created = datetime.utcfromtimestamp(job_dir.stat().st_mtime)
+
+        # Step 2 jobs share JOBS_DIR — classify them with their own marker first.
+        if _is_step2_job(job_dir):
+            _reload_step2_job(job_id, job_dir, created)
+            log.info("Reloaded job %s → %s (step2)", job_id, jobs.get(job_id).status if job_id in jobs else "?")
+            continue
 
         # Step 1 URL jobs share JOBS_DIR — classify them with their own artifacts.
         if _is_url_job(job_dir):
@@ -508,6 +601,144 @@ def _launch_url(job_id: str) -> None:
     asyncio.create_task(asyncio.to_thread(_execute_url_pipeline, job_id))
 
 
+# ── Step 2 (sector classification) pipeline ──────────────────────────────────────
+
+
+def _configure_sector_classifier(job_dir: Path):
+    """Import sector_classifier and point its module-level paths at this job dir.
+
+    The classifier reads INPUT_XLSX / INPUT_SHEET / CHECKPOINT_JSONL / OUTPUT_XLSX
+    as module globals; we override them per job. The input sheet name is detected
+    from the uploaded workbook (it need not be named "Sheet1_with_url").
+    """
+    import sector_classifier  # importable via PIPELINE_DIR on sys.path
+
+    input_xlsx = job_dir / "input.xlsx"
+    detected_sheet = pd.ExcelFile(input_xlsx).sheet_names[0]
+
+    sector_classifier.INPUT_XLSX = str(input_xlsx)
+    sector_classifier.INPUT_SHEET = detected_sheet
+    sector_classifier.CHECKPOINT_JSONL = str(job_dir / STEP2_CHECKPOINT)
+    sector_classifier.OUTPUT_XLSX = str(job_dir / "output" / STEP2_OUTPUT)
+    # The module reads the key at import time from pipeline/.env; make sure it picks
+    # up whatever the backend loaded from backend/.env.
+    sector_classifier.ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+    return sector_classifier
+
+
+def _execute_step2_test(job_id: str) -> None:
+    """Run a live test classification (first 20 rows) for a Step 2 job."""
+    job = jobs[job_id]
+    job_dir = JOBS_DIR / job_id
+    prev_cwd = os.getcwd()
+    try:
+        job.status = "running"
+        job.message = "Classifying 20 rows (live API)…"
+        job.error = None
+
+        # Batch/output files are relative paths — run inside the job dir.
+        os.chdir(job_dir)
+        sc = _configure_sector_classifier(job_dir)
+        sc.cmd_test()
+
+        output = _find_step2_output(job_dir)
+        if output is None:
+            raise RuntimeError("test run finished but produced no classified workbook")
+
+        job.output_path = output
+        job.summary = _step2_summary(output, "test")
+        job.status = "complete"
+        job.message = "Complete"
+        log.info("Step 2 test job %s complete → %s", job_id, output)
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — surface any failure to the user
+        log.exception("Step 2 test job %s failed", job_id)
+        job.status = "error"
+        job.error = str(exc)
+        job.message = f"Error: {exc}"
+    finally:
+        os.chdir(prev_cwd)
+
+
+def _execute_step2_submit(job_id: str) -> None:
+    """Submit the full classification job to the Anthropic Batch API (50% off)."""
+    job = jobs[job_id]
+    job_dir = JOBS_DIR / job_id
+    prev_cwd = os.getcwd()
+    try:
+        job.status = "running"
+        job.message = "Submitting batch…"
+        job.error = None
+
+        os.chdir(job_dir)
+        sc = _configure_sector_classifier(job_dir)
+        sc.cmd_batch_submit()
+
+        batch_id_file = job_dir / STEP2_BATCH_ID
+        if not batch_id_file.exists():
+            raise RuntimeError("batch submit finished but wrote no batch_id.txt")
+        batch_id = batch_id_file.read_text(encoding="utf-8").strip()
+
+        job.batch_id = batch_id
+        job.status = "batch_submitted"
+        job.message = f"Batch submitted — ID: {batch_id}"
+        log.info("Step 2 batch job %s submitted → %s", job_id, batch_id)
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — surface any failure to the user
+        log.exception("Step 2 batch submit %s failed", job_id)
+        job.status = "error"
+        job.error = str(exc)
+        job.message = f"Error: {exc}"
+    finally:
+        os.chdir(prev_cwd)
+
+
+def _execute_step2_check(job_id: str) -> None:
+    """Poll the batch and, if it has ended, download results + write the workbook."""
+    job = jobs[job_id]
+    job_dir = JOBS_DIR / job_id
+    prev_cwd = os.getcwd()
+    try:
+        job.status = "running"
+        job.message = "Checking batch results…"
+        job.error = None
+
+        os.chdir(job_dir)
+        sc = _configure_sector_classifier(job_dir)
+        sc.cmd_batch_results()  # writes the workbook only once the batch has ended
+
+        output = _find_step2_output(job_dir)
+        if output is not None:
+            job.output_path = output
+            job.summary = _step2_summary(output, "batch")
+            job.status = "complete"
+            job.message = "Complete"
+            log.info("Step 2 batch job %s complete → %s", job_id, output)
+        else:
+            # Still processing on Anthropic's side — back to the waiting state.
+            job.status = "batch_submitted"
+            job.message = (
+                f"Batch still processing — ID: {job.batch_id}. Check again shortly."
+                if job.batch_id else "Batch still processing — check again shortly."
+            )
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — surface any failure to the user
+        log.exception("Step 2 batch check %s failed", job_id)
+        job.status = "error"
+        job.error = str(exc)
+        job.message = f"Error: {exc}"
+    finally:
+        os.chdir(prev_cwd)
+
+
+def _launch_step2(job_id: str, mode: str) -> None:
+    """Schedule a Step 2 run (test or batch submit) on a worker thread."""
+    fn = _execute_step2_test if mode == "test" else _execute_step2_submit
+    asyncio.create_task(asyncio.to_thread(fn, job_id))
+
+
+def _launch_step2_check(job_id: str) -> None:
+    """Schedule a Step 2 batch results check on a worker thread."""
+    asyncio.create_task(asyncio.to_thread(_execute_step2_check, job_id))
+
+
 # ── app ──────────────────────────────────────────────────────────────────────
 
 
@@ -694,4 +925,126 @@ async def list_url_jobs():
         }
         for j in sorted(jobs.values(), key=lambda x: x.created_at, reverse=True)
         if j.step == "step1url"
+    ]
+
+
+# ── Step 2 (sector classification) endpoints — prefix /api/step2/ ────────────────
+
+
+@app.get("/api/step2/step1-jobs")
+async def list_step1_jobs_for_step2():
+    """Completed Step 1 (URL discovery) jobs, for the Step 2 linking dropdown."""
+    return [
+        {
+            "job_id": j.job_id,
+            "created_at": j.created_at.isoformat(),
+        }
+        for j in sorted(jobs.values(), key=lambda x: x.created_at, reverse=True)
+        if j.step == "step1url" and j.status == "complete"
+    ]
+
+
+@app.post("/api/step2/run")
+async def run_step2(
+    file: UploadFile = File(...),
+    step1_job_id: str = Form(...),
+    mode: str = Form(...),
+):
+    if _is_running():
+        raise HTTPException(status_code=409, detail="Another job is currently running.")
+
+    if mode not in ("test", "batch"):
+        raise HTTPException(status_code=400, detail="mode must be 'test' or 'batch'.")
+    if not (file.filename or "").lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Please upload an .xlsx file.")
+
+    job_id = str(uuid.uuid4())
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    # Tag this job dir as a Step 2 job so it reloads correctly after a restart.
+    (job_dir / STEP2_MARKER).write_text("step2", encoding="utf-8")
+
+    input_path = job_dir / "input.xlsx"
+    with input_path.open("wb") as out:
+        shutil.copyfileobj(file.file, out)
+
+    # Link the selected Step 1 job by copying its checkpoint. If it's missing the
+    # classifier still works — it falls back to name + url + title signals.
+    src_checkpoint = JOBS_DIR / step1_job_id / STEP2_CHECKPOINT
+    if src_checkpoint.exists():
+        shutil.copyfile(src_checkpoint, job_dir / STEP2_CHECKPOINT)
+        log.info("Step 2 job %s linked checkpoint from Step 1 job %s", job_id, step1_job_id)
+    else:
+        log.info("Step 2 job %s: no checkpoint in Step 1 job %s — name+url+title only",
+                 job_id, step1_job_id)
+
+    jobs[job_id] = JobState(
+        job_id=job_id, status="queued", message="Queued", step="step2", mode=mode
+    )
+    _launch_step2(job_id, mode)
+    return {"job_id": job_id, "status": "queued", "mode": mode}
+
+
+@app.post("/api/step2/check-results/{job_id}")
+async def check_results_step2(job_id: str):
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if _is_running():
+        raise HTTPException(status_code=409, detail="Another job is currently running.")
+
+    job_dir = JOBS_DIR / job_id
+    if not (job_dir / STEP2_BATCH_ID).exists():
+        raise HTTPException(status_code=400, detail="No batch was submitted for this job.")
+
+    job.status = "queued"
+    job.message = "Checking batch results…"
+    _launch_step2_check(job_id)
+    return {"job_id": job_id, "status": "queued", "mode": job.mode}
+
+
+@app.get("/api/step2/status/{job_id}")
+async def status_step2(job_id: str):
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "message": job.message,
+        "mode": job.mode,
+        "batch_id": job.batch_id,
+        "summary": job.summary,
+    }
+
+
+@app.get("/api/step2/download/{job_id}")
+async def download_step2(job_id: str):
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job.status != "complete" or job.output_path is None or not job.output_path.exists():
+        raise HTTPException(status_code=404, detail="Output not ready.")
+    return FileResponse(
+        path=str(job.output_path),
+        filename=job.output_path.name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.get("/api/step2/jobs")
+async def list_step2_jobs():
+    return [
+        {
+            "job_id": j.job_id,
+            "status": j.status,
+            "message": j.message,
+            "mode": j.mode,
+            "batch_id": j.batch_id,
+            "summary": j.summary,
+            "created_at": j.created_at.isoformat(),
+        }
+        for j in sorted(jobs.values(), key=lambda x: x.created_at, reverse=True)
+        if j.step == "step2"
     ]

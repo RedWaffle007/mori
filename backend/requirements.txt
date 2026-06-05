@@ -5,6 +5,7 @@ python-dotenv
 pandas
 openpyxl
 anthropic
+aiohttp
 scrapegraphai
 requests
 tqdm

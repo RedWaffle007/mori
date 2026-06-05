@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Step 2 — Sector Classification</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    .back-link { margin: 0 0 14px; font-size: 13px; }
+    .back-link a { color: var(--muted); text-decoration: none; }
+    .back-link a:hover { color: var(--text); }
+
+    .field-label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    select {
+      width: 100%;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #fafbfc;
+      font-size: 14px;
+      margin-bottom: 16px;
+    }
+    .button-row { display: flex; gap: 10px; flex-wrap: wrap; }
+    .button-row button.secondary {
+      background: var(--card);
+      color: var(--text);
+    }
+    .batch-info {
+      margin-top: 16px;
+      font-size: 14px;
+      background: var(--amber-bg);
+      color: var(--amber);
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+    .batch-info code { font-size: 13px; }
+
+    /* Existing-job cards reuse .resume-card from style.css */
+    .job-card-actions { display: flex; gap: 8px; align-items: center; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <header>
+      <p class="back-link"><a href="index.html">← All steps</a></p>
+      <h1>Step 2 — Sector Classification</h1>
+      <p class="subtitle">
+        Classify companies into <strong>MSP IT Services</strong>,
+        <strong>Cybersecurity Services</strong>,
+        <strong>Telecom / Connectivity Services</strong>, or <strong>Other</strong>
+        using Claude. Upload the promoted workbook from Step 1 and link the Step 1
+        job so its scraped website content can be used as a signal.
+      </p>
+    </header>
+
+    <!-- Existing Step 2 jobs -->
+    <section id="existing-section" class="hidden">
+      <h2>Existing Step 2 jobs</h2>
+      <div id="existing-list"></div>
+    </section>
+
+    <!-- New job -->
+    <section id="upload-section">
+      <h2>New job</h2>
+
+      <label class="field-label" for="step1-select">Select Step 1 job</label>
+      <select id="step1-select"></select>
+
+      <label class="field-label" for="file-input">Upload promoted .xlsx from Step 1</label>
+      <label class="file-field">
+        <input type="file" id="file-input" accept=".xlsx" />
+      </label>
+
+      <div class="button-row">
+        <button id="test-btn" type="button">Test — 20 rows</button>
+        <button id="batch-btn" type="button" class="secondary">Submit Full Batch</button>
+      </div>
+      <p id="upload-error" class="error hidden"></p>
+    </section>
+
+    <!-- Active job status -->
+    <section id="status-section" class="hidden">
+      <h2>Job status</h2>
+      <div class="job-id-row">
+        <span class="label">Job ID:</span>
+        <code id="job-id"></code>
+      </div>
+      <div id="status-row" class="status-row">
+        <span id="spinner" class="spinner hidden"></span>
+        <span id="status-badge" class="badge"></span>
+        <span id="status-message" class="status-message"></span>
+      </div>
+      <p id="job-error" class="error hidden"></p>
+
+      <div id="batch-info" class="batch-info hidden"></div>
+      <button id="check-btn" type="button" class="hidden">Check Results</button>
+
+      <a id="download-btn" class="download-btn hidden" href="#">Download Output</a>
+      <div id="summary-card" class="summary-card hidden"></div>
+    </section>
+  </main>
+
+  <script>
+    // ── config ────────────────────────────────────────────────────────────────
+    const API_BASE = "http://localhost:8000";
+    const TEST_POLL_MS = 4000;
+    const BATCH_POLL_MS = 10000;
+
+    // ── elements ──────────────────────────────────────────────────────────────
+    const els = {
+      existingSection: document.getElementById("existing-section"),
+      existingList: document.getElementById("existing-list"),
+      step1Select: document.getElementById("step1-select"),
+      fileInput: document.getElementById("file-input"),
+      testBtn: document.getElementById("test-btn"),
+      batchBtn: document.getElementById("batch-btn"),
+      uploadError: document.getElementById("upload-error"),
+      statusSection: document.getElementById("status-section"),
+      jobId: document.getElementById("job-id"),
+      spinner: document.getElementById("spinner"),
+      statusBadge: document.getElementById("status-badge"),
+      statusMessage: document.getElementById("status-message"),
+      jobError: document.getElementById("job-error"),
+      batchInfo: document.getElementById("batch-info"),
+      checkBtn: document.getElementById("check-btn"),
+      downloadBtn: document.getElementById("download-btn"),
+      summaryCard: document.getElementById("summary-card"),
+    };
+
+    let pollTimer = null;
+    let currentJobId = null;
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+    function show(el) { el.classList.remove("hidden"); }
+    function hide(el) { el.classList.add("hidden"); }
+
+    function setBadge(status) {
+      els.statusBadge.textContent = status.replace("_", " ");
+      els.statusBadge.className = "badge " + status;
+    }
+
+    function shortId(id) { return (id || "").slice(0, 8); }
+
+    function fmtDate(iso) {
+      if (!iso) return "";
+      const d = new Date(iso);
+      return isNaN(d) ? iso : d.toLocaleString();
+    }
+
+    // ── populate the Step 1 job dropdown ────────────────────────────────────────
+    async function loadStep1Jobs() {
+      try {
+        const res = await fetch(`${API_BASE}/api/step2/step1-jobs`);
+        if (!res.ok) return;
+        const jobs = await res.json();
+        els.step1Select.innerHTML = "";
+        if (jobs.length === 0) {
+          const opt = document.createElement("option");
+          opt.value = "";
+          opt.textContent = "No completed Step 1 jobs found";
+          opt.disabled = true;
+          opt.selected = true;
+          els.step1Select.appendChild(opt);
+          return;
+        }
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = "— Select a Step 1 job —";
+        els.step1Select.appendChild(placeholder);
+        jobs.forEach((j) => {
+          const opt = document.createElement("option");
+          opt.value = j.job_id;
+          opt.textContent = `Job ${shortId(j.job_id)} — ${fmtDate(j.created_at)}`;
+          els.step1Select.appendChild(opt);
+        });
+      } catch (err) {
+        console.error("Failed to load Step 1 jobs:", err);
+      }
+    }
+
+    // ── existing Step 2 jobs ────────────────────────────────────────────────────
+    async function loadStep2Jobs() {
+      try {
+        const res = await fetch(`${API_BASE}/api/step2/jobs`);
+        if (!res.ok) return;
+        const jobs = await res.json();
+        els.existingList.innerHTML = "";
+        if (jobs.length === 0) {
+          hide(els.existingSection);
+          return;
+        }
+        jobs.forEach((job) => {
+          const card = document.createElement("div");
+          card.className = "resume-card";
+
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          const modeLabel = job.mode ? ` · ${job.mode}` : "";
+          meta.innerHTML =
+            `<div><span class="badge ${job.status}">${job.status.replace("_", " ")}</span>${modeLabel}</div>` +
+            `<code>${job.job_id}</code>`;
+          card.appendChild(meta);
+
+          const actions = document.createElement("div");
+          actions.className = "job-card-actions";
+
+          if (job.status === "complete") {
+            const dl = document.createElement("a");
+            dl.className = "download-btn";
+            dl.style.marginTop = "0";
+            dl.href = `${API_BASE}/api/step2/download/${job.job_id}`;
+            dl.textContent = "Download";
+            actions.appendChild(dl);
+          } else if (job.status === "batch_submitted") {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.textContent = "Resume";
+            btn.addEventListener("click", () => {
+              startTracking(job.job_id, "batch");
+              renderStatus({
+                status: "batch_submitted",
+                message: job.message,
+                mode: "batch",
+                batch_id: job.batch_id,
+              });
+            });
+            actions.appendChild(btn);
+          }
+          card.appendChild(actions);
+          els.existingList.appendChild(card);
+        });
+        show(els.existingSection);
+      } catch (err) {
+        console.error("Failed to load Step 2 jobs:", err);
+      }
+    }
+
+    // ── run a new job ────────────────────────────────────────────────────────────
+    async function runJob(mode) {
+      hide(els.uploadError);
+      const step1JobId = els.step1Select.value;
+      const file = els.fileInput.files[0];
+
+      if (!step1JobId) {
+        els.uploadError.textContent = "Please select a Step 1 job first.";
+        show(els.uploadError);
+        return;
+      }
+      if (!file) {
+        els.uploadError.textContent = "Please choose the promoted .xlsx file.";
+        show(els.uploadError);
+        return;
+      }
+
+      const form = new FormData();
+      form.append("file", file);
+      form.append("step1_job_id", step1JobId);
+      form.append("mode", mode);
+
+      els.testBtn.disabled = true;
+      els.batchBtn.disabled = true;
+      try {
+        const res = await fetch(`${API_BASE}/api/step2/run`, { method: "POST", body: form });
+        if (res.status === 409) {
+          els.uploadError.textContent = "Another job is already running. Please wait for it to finish.";
+          show(els.uploadError);
+          return;
+        }
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({}));
+          els.uploadError.textContent = detail.detail || `Upload failed (${res.status}).`;
+          show(els.uploadError);
+          return;
+        }
+        const data = await res.json();
+        startTracking(data.job_id, mode);
+      } catch (err) {
+        els.uploadError.textContent = "Could not reach the server.";
+        show(els.uploadError);
+      } finally {
+        els.testBtn.disabled = false;
+        els.batchBtn.disabled = false;
+      }
+    }
+
+    // ── status tracking ──────────────────────────────────────────────────────────
+    function startTracking(jobId, mode) {
+      if (pollTimer) clearInterval(pollTimer);
+      currentJobId = jobId;
+
+      show(els.statusSection);
+      els.jobId.textContent = jobId;
+      hide(els.jobError);
+      hide(els.downloadBtn);
+      hide(els.summaryCard);
+      hide(els.batchInfo);
+      hide(els.checkBtn);
+      els.summaryCard.innerHTML = "";
+      setBadge("queued");
+      els.statusMessage.textContent = "Queued…";
+      show(els.spinner);
+
+      const interval = mode === "batch" ? BATCH_POLL_MS : TEST_POLL_MS;
+      poll(jobId);
+      pollTimer = setInterval(() => poll(jobId), interval);
+    }
+
+    async function poll(jobId) {
+      try {
+        const res = await fetch(`${API_BASE}/api/step2/status/${jobId}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        renderStatus(data);
+      } catch (err) {
+        // transient network error — keep polling
+      }
+    }
+
+    function renderStatus(data) {
+      setBadge(data.status);
+      els.statusMessage.textContent = data.message || "";
+
+      if (data.status === "complete") {
+        clearInterval(pollTimer);
+        hide(els.spinner);
+        hide(els.batchInfo);
+        hide(els.checkBtn);
+        els.downloadBtn.href = `${API_BASE}/api/step2/download/${currentJobId}`;
+        show(els.downloadBtn);
+        renderSummary(data.summary);
+        loadStep2Jobs();
+      } else if (data.status === "error") {
+        clearInterval(pollTimer);
+        hide(els.spinner);
+        hide(els.checkBtn);
+        els.jobError.textContent = data.message || "The job failed.";
+        show(els.jobError);
+      } else if (data.status === "batch_submitted") {
+        // Batch is now on Anthropic's servers — stop polling and wait for the user.
+        clearInterval(pollTimer);
+        hide(els.spinner);
+        els.batchInfo.innerHTML =
+          `Batch submitted — ID: <code>${data.batch_id || ""}</code>. ` +
+          `Results can take up to 24h. Click <strong>Check Results</strong> to poll.`;
+        show(els.batchInfo);
+        show(els.checkBtn);
+      } else {
+        // queued / running
+        show(els.spinner);
+        hide(els.checkBtn);
+      }
+    }
+
+    // ── check batch results ──────────────────────────────────────────────────────
+    async function checkResults() {
+      if (!currentJobId) return;
+      els.checkBtn.disabled = true;
+      try {
+        const res = await fetch(`${API_BASE}/api/step2/check-results/${currentJobId}`, { method: "POST" });
+        if (res.status === 409) {
+          alert("Another job is already running. Please wait for it to finish.");
+          return;
+        }
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({}));
+          alert(detail.detail || `Check failed (${res.status}).`);
+          return;
+        }
+        // Now poll every 10s until complete / error / back to batch_submitted.
+        hide(els.batchInfo);
+        hide(els.checkBtn);
+        show(els.spinner);
+        setBadge("running");
+        els.statusMessage.textContent = "Checking batch results…";
+        if (pollTimer) clearInterval(pollTimer);
+        poll(currentJobId);
+        pollTimer = setInterval(() => poll(currentJobId), BATCH_POLL_MS);
+      } catch (err) {
+        alert("Could not reach the server.");
+      } finally {
+        els.checkBtn.disabled = false;
+      }
+    }
+
+    // ── summary card ──────────────────────────────────────────────────────────────
+    function renderSummary(summary) {
+      if (!summary) {
+        hide(els.summaryCard);
+        return;
+      }
+      const n = (v) => Number(v || 0).toLocaleString();
+      const heading = summary.mode === "test"
+        ? `TEST MODE — ${n(summary.rows_classified)} rows classified`
+        : `FULL BATCH — ${n(summary.rows_classified)} rows classified`;
+
+      els.summaryCard.innerHTML = `
+        <h3>${heading}</h3>
+        <table class="summary-table">
+          <tr><td>Cybersecurity Services</td><td>${n(summary.cyber)}</td></tr>
+          <tr><td>MSP IT Services</td><td>${n(summary.msp)}</td></tr>
+          <tr><td>Telecom / Connectivity</td><td>${n(summary.telecom)}</td></tr>
+          <tr><td>Other</td><td>${n(summary.other)}</td></tr>
+          <tr class="total-row"><td>Total</td><td>${n(summary.rows_classified)}</td></tr>
+        </table>
+      `;
+      show(els.summaryCard);
+    }
+
+    // ── init ──────────────────────────────────────────────────────────────────────
+    els.testBtn.addEventListener("click", () => runJob("test"));
+    els.batchBtn.addEventListener("click", () => runJob("batch"));
+    els.checkBtn.addEventListener("click", checkResults);
+    loadStep1Jobs();
+    loadStep2Jobs();
+  </script>
+</body>
+</html>

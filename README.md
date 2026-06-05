@@ -338,3 +338,144 @@ The frontend renders this as a two-part card (Stage 1 / Stage 2) below the
 
 > **One job at a time across all steps.** Starting or resuming any Step 1 or Step 4
 > job while another is running returns HTTP `409`.
+
+---
+
+# Step 2 — Sector Classification
+
+A third, independent step that runs **after** Step 1. You upload the **promoted
+workbook** produced by Step 1 and the backend classifies every company into one
+of four sectors with **Claude**. It is reached from the landing page
+(`frontend/index.html`) via the **Step 2 — Sector Classification** card, which
+opens `frontend/step2.html`.
+
+The pipeline script lives at `backend/pipeline/sector_classifier.py`.
+
+## What it does and which signals it uses
+
+For each row, Claude is given up to four signals and asked to pick exactly one
+sector:
+
+- **Business name** — from the `Business Name` column.
+- **URL** — the discovered website (`found_url`).
+- **Page title** — the `title` captured in Step 1's scrape.
+- **Website content** — the `sg_content` homepage text captured in Step 1
+  (capped at 3,000 characters per row).
+
+Page title and website content come from Step 1's `sgai_url_checkpoint.json`,
+matched to each row by URL. Rows with no scraped content fall back to
+name + url + title; rows with no checkpoint at all fall back to name + url.
+
+## The two modes
+
+| Mode           | Rows        | API          | Speed                | Cost          |
+|----------------|-------------|--------------|----------------------|---------------|
+| **Test**       | first 20    | live Messages API | instant         | full price    |
+| **Full Batch** | all rows    | Batch API    | async (up to 24h)    | **50% off**   |
+
+- **Test** classifies the first 20 rows synchronously so you can sanity-check the
+  output before committing to a full run.
+- **Full Batch** submits every row to the Anthropic Batch API. Submission returns
+  a **batch ID** immediately; results are downloaded later via **Check Results**.
+
+## Step 1 job linking — why the checkpoint matters
+
+When you submit a Step 2 job you provide two things:
+
+1. The **promoted `.xlsx`** from Step 1.
+2. A **selected Step 1 job** (from the dropdown of completed Step 1 URL jobs).
+
+Before running, the backend copies `sgai_url_checkpoint.json` from
+`jobs/{step1_job_id}/` into the new Step 2 job directory. That checkpoint holds
+the **page titles and scraped homepage content** Step 1 gathered, which are the
+richest classification signals.
+
+If the selected Step 1 job has **no checkpoint** (e.g. it predates that artifact),
+Step 2 proceeds anyway — the classifier simply falls back to **name + url + title**
+signals, which is still valid, just less informed.
+
+The uploaded workbook's **first sheet** is detected automatically
+(`pd.ExcelFile(path).sheet_names[0]`); it does not need to be named
+`Sheet1_with_url`.
+
+## Job directory
+
+```
+backend/jobs/{job_id}/
+├── .step2                      # marker tagging this as a Step 2 job
+├── input.xlsx                  # uploaded promoted workbook from Step 1
+├── sgai_url_checkpoint.json    # copied from the linked Step 1 job (optional)
+├── batch_requests.jsonl        # written by batch submit
+├── batch_id.txt                # written by batch submit (resume marker)
+├── batch_idx_mapping.json      # written by batch submit
+└── output/
+    └── sector_classified.xlsx  # final output — served for download
+```
+
+## The four output sectors
+
+The output workbook has one sheet per sector:
+
+| Sheet     | Sector                            | Covers                                                                 |
+|-----------|-----------------------------------|------------------------------------------------------------------------|
+| `cyber`   | Cybersecurity Services            | MDR/SOC, SIEM, EDR, firewall/network security, IAM/PAM, MFA, zero trust, pen testing, GRC, ISO 27001 / SOC 2 / GDPR compliance. |
+| `MSP`     | MSP IT Services                   | Managed IT support/helpdesk, RMM, infrastructure & endpoint management, backup & DR, cloud (M365/Azure/AWS), VDI, vCIO. |
+| `telecom` | Telecom / Connectivity Services   | Fibre/broadband connectivity, SD-WAN, MPLS, VoIP, UCaaS, hosted PBX, video conferencing, structured cabling. |
+| `other`   | Other                             | Anything that does not clearly fit the three sectors above.            |
+
+Each sheet carries the original columns plus a `Sector` column. There is **no**
+old-sector comparison — every row is classified fresh.
+
+## Batch resume behaviour
+
+`batch_id.txt` makes batch jobs crash-safe. The batch runs entirely on
+Anthropic's servers, so if the backend **restarts after submission**:
+
+- The job reloads from disk as **`batch_submitted`** with its `batch_id` intact.
+- Use **Check Results** to poll: when the batch has `ended`, results are
+  downloaded, `output/sector_classified.xlsx` is written, and the job flips to
+  **`complete`**.
+- If the batch is still processing, the job stays `batch_submitted` — just check
+  again later.
+
+## Output summary
+
+When a Step 2 job reaches `complete`, `GET /api/step2/status/{job_id}` includes a
+`summary` with per-sector counts (identical shape for both modes):
+
+```jsonc
+{
+  "job_id": "…",
+  "status": "complete",
+  "message": "Complete",
+  "mode": "test",            // or "batch"
+  "batch_id": null,          // set for batch mode
+  "summary": {
+    "mode": "test",
+    "rows_classified": 20,
+    "cyber": 0,
+    "msp": 0,
+    "telecom": 0,
+    "other": 0
+  }
+}
+```
+
+The frontend renders this as a sector breakdown card below the **Download Output**
+button.
+
+## Step 2 API reference — prefix `/api/step2/`
+
+| Method | Endpoint                              | Purpose                                                                 |
+|--------|---------------------------------------|-------------------------------------------------------------------------|
+| GET    | `/api/step2/step1-jobs`               | List **completed** Step 1 URL jobs (`job_id`, `created_at`) for the dropdown |
+| POST   | `/api/step2/run`                      | Multipart `file` + `step1_job_id` + `mode` (`test`/`batch`); creates the job, copies the checkpoint, runs in the background (`409` if any job is busy) |
+| POST   | `/api/step2/check-results/{job_id}`   | Trigger a batch results check in the background (`409` if any job is busy) |
+| GET    | `/api/step2/status/{job_id}`          | `{ job_id, status, message, mode, batch_id, summary }`                  |
+| GET    | `/api/step2/download/{job_id}`        | Stream `sector_classified.xlsx` (`404` if not ready)                    |
+| GET    | `/api/step2/jobs`                     | List all Step 2 jobs (for the existing-jobs / resume UI)                |
+
+> **One job at a time across all steps.** Starting a Step 2 run or a results check
+> while any Step 1 / Step 2 / Step 4 job is running returns HTTP `409`. A
+> `batch_submitted` job is **not** "running" — the batch is on Anthropic's
+> servers — so you can start other work while it processes.
