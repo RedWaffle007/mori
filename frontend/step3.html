@@ -3,13 +3,12 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Step 1 — URL Discovery</title>
+  <title>Step 3 — Email Finder</title>
   <link rel="stylesheet" href="style.css" />
   <style>
     .back-link { margin: 0 0 14px; font-size: 13px; }
     .back-link a { color: var(--muted); text-decoration: none; }
     .back-link a:hover { color: var(--text); }
-    /* Two-part summary headings already covered by .summary-card h3 in style.css */
 
     /* Required-columns info box */
     .info-box {
@@ -37,12 +36,12 @@
   <main class="card">
     <header>
       <p class="back-link"><a href="index.html">← All steps</a></p>
-      <h1>Step 1 — URL Discovery</h1>
+      <h1>Step 3 — Email Finder</h1>
       <p class="subtitle">
-        Upload an Excel file of business names. A two-stage pipeline searches for
-        each company's website (Stage 1) and then re-evaluates the low-confidence
-        matches with an improved name matcher (Stage 2). A workbook of discovered
-        URLs is returned.
+        Upload an Excel file of contacts (with <code>Fname</code>,
+        <code>Sname</code>, and <code>found_url</code> columns). Each contact is
+        looked up via the <strong>Tomba Email Finder API</strong> and a workbook of
+        discovered work emails is returned.
       </p>
     </header>
 
@@ -58,11 +57,19 @@
       <div class="info-box">
         <table class="cols-table">
           <tr>
-            <td class="col-name">Business Name</td>
-            <td class="col-desc">company name used to search for the website</td>
+            <td class="col-name">Fname</td>
+            <td class="col-desc">contact first name</td>
+          </tr>
+          <tr>
+            <td class="col-name">Sname</td>
+            <td class="col-desc">contact last name</td>
+          </tr>
+          <tr>
+            <td class="col-name">found_url</td>
+            <td class="col-desc">company website URL</td>
           </tr>
         </table>
-        <p class="cols-note">Column names are case-insensitive.</p>
+        <p class="cols-note">Column names must match exactly (case-sensitive).</p>
         <p class="cols-warn">If a required column is missing or named differently, the job will fail. Rename the column in your Excel file before uploading.</p>
       </div>
     </section>
@@ -73,7 +80,7 @@
       <label class="file-field">
         <input type="file" id="file-input" accept=".xlsx" />
       </label>
-      <button id="run-btn" type="button">Run Step 1</button>
+      <button id="run-btn" type="button">Run Step 3</button>
       <p id="upload-error" class="error hidden"></p>
     </section>
 
@@ -119,6 +126,7 @@
     };
 
     let pollTimer = null;
+    let currentJobId = null;
 
     // ── helpers ───────────────────────────────────────────────────────────────
     function show(el) { el.classList.remove("hidden"); }
@@ -132,7 +140,7 @@
     // ── interrupted jobs on load ────────────────────────────────────────────────
     async function loadJobs() {
       try {
-        const res = await fetch(`${API_BASE}/api/step1url/jobs`, {
+        const res = await fetch(`${API_BASE}/api/step3/jobs`, {
           headers: { "ngrok-skip-browser-warning": "true" },
         });
         if (!res.ok) return;
@@ -184,7 +192,7 @@
 
       els.runBtn.disabled = true;
       try {
-        const res = await fetch(`${API_BASE}/api/step1url/run`, {
+        const res = await fetch(`${API_BASE}/api/step3/run`, {
           method: "POST",
           headers: { "ngrok-skip-browser-warning": "true" },
           body: form,
@@ -213,7 +221,7 @@
     // ── resume an interrupted job ────────────────────────────────────────────────
     async function resumeJob(jobId) {
       try {
-        const res = await fetch(`${API_BASE}/api/step1url/resume/${jobId}`, { method: "POST", headers: { "ngrok-skip-browser-warning": "true" } });
+        const res = await fetch(`${API_BASE}/api/step3/resume/${jobId}`, { method: "POST", headers: { "ngrok-skip-browser-warning": "true" } });
         if (res.status === 409) {
           alert("Another job is already running. Please wait for it to finish.");
           return;
@@ -233,6 +241,7 @@
     // ── status tracking ──────────────────────────────────────────────────────────
     function startTracking(jobId) {
       if (pollTimer) clearInterval(pollTimer);
+      currentJobId = jobId;
 
       show(els.statusSection);
       els.jobId.textContent = jobId;
@@ -250,25 +259,25 @@
 
     async function poll(jobId) {
       try {
-        const res = await fetch(`${API_BASE}/api/step1url/status/${jobId}`, {
+        const res = await fetch(`${API_BASE}/api/step3/status/${jobId}`, {
           headers: { "ngrok-skip-browser-warning": "true" },
         });
         if (!res.ok) return;
         const data = await res.json();
-        renderStatus(jobId, data);
+        renderStatus(data);
       } catch (err) {
         // transient network error — keep polling
       }
     }
 
-    function renderStatus(jobId, data) {
+    function renderStatus(data) {
       setBadge(data.status);
       els.statusMessage.textContent = data.message || "";
 
       if (data.status === "complete") {
         clearInterval(pollTimer);
         hide(els.spinner);
-        els.downloadBtn.href = `${API_BASE}/api/step1url/download/${jobId}`;
+        els.downloadBtn.href = `${API_BASE}/api/step3/download/${currentJobId}`;
         show(els.downloadBtn);
         renderSummary(data.summary);
       } else if (data.status === "error") {
@@ -282,32 +291,20 @@
       }
     }
 
-    // ── two-part summary card ────────────────────────────────────────────────────
+    // ── summary card ──────────────────────────────────────────────────────────────
     function renderSummary(summary) {
-      if (!summary || !summary.stage1 || !summary.stage2) {
+      if (!summary) {
         hide(els.summaryCard);
         return;
       }
-      const s1 = summary.stage1;
-      const s2 = summary.stage2;
       const n = (v) => Number(v || 0).toLocaleString();
-
       els.summaryCard.innerHTML = `
-        <h3>Stage 1 — URL Discovery</h3>
+        <h3>Email Finder — Results</h3>
         <table class="summary-table">
-          <tr><td>HIGH confidence</td><td>${n(s1.high)}</td></tr>
-          <tr><td>MEDIUM confidence</td><td>${n(s1.medium)}</td></tr>
-          <tr><td>LOW</td><td>${n(s1.low)}</td></tr>
-          <tr><td>Discard</td><td>${n(s1.discard)}</td></tr>
-          <tr class="total-row"><td>Total</td><td>${n(s1.total)}</td></tr>
-        </table>
-        <h3>Stage 2 — Low Promoter</h3>
-        <table class="summary-table">
-          <tr><td>Promoted to HIGH</td><td>${n(s2.promoted_high)}</td></tr>
-          <tr><td>Promoted to MEDIUM</td><td>${n(s2.promoted_medium)}</td></tr>
-          <tr><td>Remaining LOW</td><td>${n(s2.remaining_low)}</td></tr>
-          <tr><td>Discard</td><td>${n(s2.discard)}</td></tr>
-          <tr class="total-row"><td>Final with URL</td><td>${n(s2.final_with_url)}</td></tr>
+          <tr><td>Sheets processed</td><td>${n(summary.sheets_processed)}</td></tr>
+          <tr><td>Total rows</td><td>${n(summary.total_rows)}</td></tr>
+          <tr><td>Emails found</td><td>${n(summary.emails_found)}</td></tr>
+          <tr><td>No email</td><td>${n(summary.no_email)}</td></tr>
         </table>
       `;
       show(els.summaryCard);

@@ -1,5 +1,6 @@
 // ── config ──────────────────────────────────────────────────────────────────
-const API_BASE = "http://localhost:8000";
+// Same origin the page was served from — works locally, via ngrok, or any domain.
+const API_BASE = window.location.origin;
 const POLL_INTERVAL_MS = 4000;
 
 // ── elements ────────────────────────────────────────────────────────────────
@@ -33,7 +34,9 @@ function setBadge(status) {
 // ── interrupted jobs on load ──────────────────────────────────────────────────
 async function loadJobs() {
   try {
-    const res = await fetch(`${API_BASE}/api/step1/jobs`);
+    const res = await fetch(`${API_BASE}/api/step1/jobs`, {
+      headers: { "ngrok-skip-browser-warning": "true" },
+    });
     if (!res.ok) return;
     const jobs = await res.json();
     const resumable = jobs.filter((j) => j.status === "interrupted");
@@ -85,6 +88,7 @@ async function runJob() {
   try {
     const res = await fetch(`${API_BASE}/api/step1/run`, {
       method: "POST",
+      headers: { "ngrok-skip-browser-warning": "true" },
       body: form,
     });
     if (res.status === 409) {
@@ -111,7 +115,7 @@ async function runJob() {
 // ── resume an interrupted job ──────────────────────────────────────────────────
 async function resumeJob(jobId) {
   try {
-    const res = await fetch(`${API_BASE}/api/step1/resume/${jobId}`, { method: "POST" });
+    const res = await fetch(`${API_BASE}/api/step1/resume/${jobId}`, { method: "POST", headers: { "ngrok-skip-browser-warning": "true" } });
     if (res.status === 409) {
       alert("Another job is already running. Please wait for it to finish.");
       return;
@@ -148,7 +152,9 @@ function startTracking(jobId) {
 
 async function poll(jobId) {
   try {
-    const res = await fetch(`${API_BASE}/api/step1/status/${jobId}`);
+    const res = await fetch(`${API_BASE}/api/step1/status/${jobId}`, {
+      headers: { "ngrok-skip-browser-warning": "true" },
+    });
     if (!res.ok) return;
     const data = await res.json();
     renderStatus(jobId, data);

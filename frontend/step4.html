@@ -9,6 +9,27 @@
     .back-link { margin: 0 0 14px; font-size: 13px; }
     .back-link a { color: var(--muted); text-decoration: none; }
     .back-link a:hover { color: var(--text); }
+
+    /* Required-columns info box */
+    .info-box {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #fafbfc;
+      padding: 14px 16px;
+    }
+    .cols-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    .cols-table td { padding: 5px 0; border-bottom: 1px solid var(--border); vertical-align: top; }
+    .cols-table tr:last-child td { border-bottom: none; }
+    .cols-table .col-name {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-weight: 600;
+      white-space: nowrap;
+      padding-right: 16px;
+      color: var(--text);
+    }
+    .cols-table .col-desc { color: var(--muted); }
+    .cols-note { font-size: 13px; color: var(--muted); margin: 12px 0 0; }
+    .cols-warn { font-size: 13px; color: var(--red); margin: 8px 0 0; }
   </style>
 </head>
 <body>
@@ -26,6 +47,25 @@
     <section id="resume-section" class="hidden">
       <h2>Resumable jobs</h2>
       <div id="resume-list"></div>
+    </section>
+
+    <!-- Required columns -->
+    <section id="required-cols-section">
+      <h2>Required columns</h2>
+      <div class="info-box">
+        <table class="cols-table">
+          <tr>
+            <td class="col-name">website</td>
+            <td class="col-desc">company website URL</td>
+          </tr>
+          <tr>
+            <td class="col-name">add1, add2, town, county, postcode</td>
+            <td class="col-desc">optional address columns, used for comparison if present</td>
+          </tr>
+        </table>
+        <p class="cols-note">Column names are case-insensitive.</p>
+        <p class="cols-warn">If a required column is missing or named differently, the job will fail. Rename the column in your Excel file before uploading.</p>
+      </div>
     </section>
 
     <!-- New upload -->

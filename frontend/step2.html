@@ -42,6 +42,27 @@
 
     /* Existing-job cards reuse .resume-card from style.css */
     .job-card-actions { display: flex; gap: 8px; align-items: center; }
+
+    /* Required-columns info box */
+    .info-box {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #fafbfc;
+      padding: 14px 16px;
+    }
+    .cols-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    .cols-table td { padding: 5px 0; border-bottom: 1px solid var(--border); vertical-align: top; }
+    .cols-table tr:last-child td { border-bottom: none; }
+    .cols-table .col-name {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-weight: 600;
+      white-space: nowrap;
+      padding-right: 16px;
+      color: var(--text);
+    }
+    .cols-table .col-desc { color: var(--muted); }
+    .cols-note { font-size: 13px; color: var(--muted); margin: 12px 0 0; }
+    .cols-warn { font-size: 13px; color: var(--red); margin: 8px 0 0; }
   </style>
 </head>
 <body>
@@ -62,6 +83,29 @@
     <section id="existing-section" class="hidden">
       <h2>Existing Step 2 jobs</h2>
       <div id="existing-list"></div>
+    </section>
+
+    <!-- Required columns -->
+    <section id="required-cols-section">
+      <h2>Required columns</h2>
+      <div class="info-box">
+        <table class="cols-table">
+          <tr>
+            <td class="col-name">Business Name</td>
+            <td class="col-desc">company name</td>
+          </tr>
+          <tr>
+            <td class="col-name">found_url</td>
+            <td class="col-desc">website URL discovered in Step 1</td>
+          </tr>
+          <tr>
+            <td class="col-name">Company Number</td>
+            <td class="col-desc">company registration number</td>
+          </tr>
+        </table>
+        <p class="cols-note">Column names must match exactly (case-sensitive).</p>
+        <p class="cols-warn">If a required column is missing or named differently, the job will fail. Rename the column in your Excel file before uploading.</p>
+      </div>
     </section>
 
     <!-- New job -->
@@ -107,7 +151,8 @@
 
   <script>
     // ── config ────────────────────────────────────────────────────────────────
-    const API_BASE = "http://localhost:8000";
+    // Same origin the page was served from — works locally, via ngrok, or any domain.
+    const API_BASE = window.location.origin;
     const TEST_POLL_MS = 4000;
     const BATCH_POLL_MS = 10000;
 
@@ -155,7 +200,9 @@
     // ── populate the Step 1 job dropdown ────────────────────────────────────────
     async function loadStep1Jobs() {
       try {
-        const res = await fetch(`${API_BASE}/api/step2/step1-jobs`);
+        const res = await fetch(`${API_BASE}/api/step2/step1-jobs`, {
+          headers: { "ngrok-skip-browser-warning": "true" },
+        });
         if (!res.ok) return;
         const jobs = await res.json();
         els.step1Select.innerHTML = "";
@@ -186,7 +233,9 @@
     // ── existing Step 2 jobs ────────────────────────────────────────────────────
     async function loadStep2Jobs() {
       try {
-        const res = await fetch(`${API_BASE}/api/step2/jobs`);
+        const res = await fetch(`${API_BASE}/api/step2/jobs`, {
+          headers: { "ngrok-skip-browser-warning": "true" },
+        });
         if (!res.ok) return;
         const jobs = await res.json();
         els.existingList.innerHTML = "";
@@ -265,7 +314,7 @@
       els.testBtn.disabled = true;
       els.batchBtn.disabled = true;
       try {
-        const res = await fetch(`${API_BASE}/api/step2/run`, { method: "POST", body: form });
+        const res = await fetch(`${API_BASE}/api/step2/run`, { method: "POST", headers: { "ngrok-skip-browser-warning": "true" }, body: form });
         if (res.status === 409) {
           els.uploadError.textContent = "Another job is already running. Please wait for it to finish.";
           show(els.uploadError);
@@ -312,7 +361,9 @@
 
     async function poll(jobId) {
       try {
-        const res = await fetch(`${API_BASE}/api/step2/status/${jobId}`);
+        const res = await fetch(`${API_BASE}/api/step2/status/${jobId}`, {
+          headers: { "ngrok-skip-browser-warning": "true" },
+        });
         if (!res.ok) return;
         const data = await res.json();
         renderStatus(data);
@@ -361,7 +412,7 @@
       if (!currentJobId) return;
       els.checkBtn.disabled = true;
       try {
-        const res = await fetch(`${API_BASE}/api/step2/check-results/${currentJobId}`, { method: "POST" });
+        const res = await fetch(`${API_BASE}/api/step2/check-results/${currentJobId}`, { method: "POST", headers: { "ngrok-skip-browser-warning": "true" } });
         if (res.status === 409) {
           alert("Another job is already running. Please wait for it to finish.");
           return;

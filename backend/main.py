@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 # ── paths ──────────────────────────────────────────────────────────────────────
 
@@ -76,6 +77,15 @@ STEP2_MARKER = ".step2"                       # marker file written when a Step 
 STEP2_CHECKPOINT = "sgai_url_checkpoint.json" # copied from the linked Step 1 job (optional)
 STEP2_BATCH_ID = "batch_id.txt"               # written by batch submit (resume marker)
 STEP2_OUTPUT = "sector_classified.xlsx"       # final output (served for download)
+
+# ── Step 3 (email finder) artifacts ──────────────────────────────────────────────
+# Step 3 shares JOBS_DIR with the other steps. A hidden marker tags a job dir as a
+# Step 3 job so it reloads correctly after a restart. The Tomba checkpoint is
+# deleted on a fully successful run, so its presence (with no output) means the
+# job was interrupted and can be resumed.
+STEP3_MARKER = ".step3"                       # marker file written when a Step 3 job is created
+STEP3_CHECKPOINT = "input_tomba_checkpoint.json"  # per-row checkpoint (resumable)
+STEP3_OUTPUT = "input_tomba.xlsx"             # final output (served for download)
 
 # Haiku 4.5 batch pricing (matches extract_addresses.py) used for cost tracking.
 _INPUT_COST_PER_TOKEN = 0.50 / 1_000_000   # $0.50 per 1 M input tokens
@@ -179,6 +189,37 @@ def _step2_summary(output_path: Path, mode: str) -> dict:
     }
 
 
+def _is_step3_job(job_dir: Path) -> bool:
+    """A job dir belongs to the Step 3 pipeline if it carries the Step 3 marker."""
+    return (job_dir / STEP3_MARKER).exists()
+
+
+def _find_step3_output(job_dir: Path) -> Path | None:
+    """Return the Tomba workbook if it has been produced, else None."""
+    out = job_dir / "output" / STEP3_OUTPUT
+    return out if out.exists() else None
+
+
+def _step3_summary(output_path: Path) -> dict:
+    """Tally the {sheet}_email / {sheet}_no_email pairs of a completed workbook."""
+    xl = pd.ExcelFile(output_path)
+    sheets_processed = total_rows = emails_found = no_email = 0
+    for sheet in xl.sheet_names:
+        n = len(pd.read_excel(xl, sheet_name=sheet, dtype=str))
+        total_rows += n
+        if sheet.endswith("_no_email"):
+            no_email += n
+        elif sheet.endswith("_email"):
+            emails_found += n
+            sheets_processed += 1  # one source sheet per *_email sheet
+    return {
+        "sheets_processed": sheets_processed,
+        "total_rows": total_rows,
+        "emails_found": emails_found,
+        "no_email": no_email,
+    }
+
+
 # ── startup: reload jobs from disk ───────────────────────────────────────────────
 
 
@@ -247,6 +288,34 @@ def _reload_step2_job(job_id: str, job_dir: Path, created: datetime) -> None:
         )
 
 
+def _reload_step3_job(job_id: str, job_dir: Path, created: datetime) -> None:
+    output = _find_step3_output(job_dir)
+    if output is not None:
+        try:
+            summary = _step3_summary(output)
+        except Exception:  # noqa: BLE001 — summary is best-effort on reload
+            summary = None
+        jobs[job_id] = JobState(
+            job_id=job_id,
+            status="complete",
+            message="Complete",
+            step="step3",
+            output_path=output,
+            summary=summary,
+            created_at=created,
+        )
+    elif (job_dir / "input.xlsx").exists():
+        # Has an input (and possibly a checkpoint) but no finished output → the job
+        # was interrupted and can be resumed from its Tomba checkpoint.
+        jobs[job_id] = JobState(
+            job_id=job_id,
+            status="interrupted",
+            message="Interrupted — resume available",
+            step="step3",
+            created_at=created,
+        )
+
+
 def _reload_jobs() -> None:
     if not JOBS_DIR.exists():
         return
@@ -255,6 +324,12 @@ def _reload_jobs() -> None:
             continue
         job_id = job_dir.name
         created = datetime.utcfromtimestamp(job_dir.stat().st_mtime)
+
+        # Step 3 jobs share JOBS_DIR — classify them with their own marker first.
+        if _is_step3_job(job_dir):
+            _reload_step3_job(job_id, job_dir, created)
+            log.info("Reloaded job %s → %s (step3)", job_id, jobs.get(job_id).status if job_id in jobs else "?")
+            continue
 
         # Step 2 jobs share JOBS_DIR — classify them with their own marker first.
         if _is_step2_job(job_dir):
@@ -739,6 +814,72 @@ def _launch_step2_check(job_id: str) -> None:
     asyncio.create_task(asyncio.to_thread(_execute_step2_check, job_id))
 
 
+# ── Step 3 (email finder) pipeline ───────────────────────────────────────────────
+
+
+def _execute_step3_pipeline(job_id: str) -> None:
+    """Run the Tomba email-finder pipeline for a job in its own working dir.
+
+    The pipeline checkpoints every processed row to input_tomba_checkpoint.json and
+    deletes it on a fully successful run, so an interrupted job resumes by simply
+    pointing main() at the same job directory again.
+    """
+    job = jobs[job_id]
+    job_dir = JOBS_DIR / job_id
+    input_file = job_dir / "input.xlsx"
+    prev_cwd = os.getcwd()
+
+    try:
+        job.status = "running"
+        job.message = "Finding emails…"
+        job.error = None
+
+        # The pipeline writes its checkpoint/output relative to the cwd; switch into
+        # the job dir so everything lands inside jobs/{job_id}/.
+        os.chdir(job_dir)
+        (job_dir / "output").mkdir(parents=True, exist_ok=True)
+
+        import tomba_email_finder  # importable via PIPELINE_DIR on sys.path
+
+        # Point the module at this job's paths and make sure it sees the Tomba keys
+        # the backend loaded from backend/.env (set on os.environ before launch).
+        tomba_email_finder.INPUT_PATH = input_file
+        tomba_email_finder.OUTPUT_PATH = job_dir / "output" / STEP3_OUTPUT
+        tomba_email_finder.CHECKPOINT_PATH = job_dir / STEP3_CHECKPOINT
+        tomba_email_finder.TOMBA_API_KEY = os.environ.get("TOMBA_API_KEY")
+        tomba_email_finder.TOMBA_SECRET = os.environ.get("TOMBA_SECRET")
+
+        def progress_cb(current, total, label):
+            job.message = f"Processing: {current} / {total} ({label})"
+
+        summary = tomba_email_finder.main(progress_cb=progress_cb)
+
+        output = _find_step3_output(job_dir)
+        if output is None:
+            raise RuntimeError("pipeline finished but produced no output workbook")
+
+        job.output_path = output
+        job.summary = summary
+        job.status = "complete"
+        job.message = "Complete"
+        log.info("Step 3 job %s complete → %s", job_id, output)
+
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — surface any failure to the user
+        # main() calls sys.exit() on fatal input errors; SystemExit isn't an
+        # Exception, so catch it explicitly to avoid leaving the job wedged.
+        log.exception("Step 3 job %s failed", job_id)
+        job.status = "error"
+        job.error = str(exc)
+        job.message = f"Error: {exc}"
+    finally:
+        os.chdir(prev_cwd)
+
+
+def _launch_step3(job_id: str) -> None:
+    """Schedule the email-finder pipeline on a worker thread."""
+    asyncio.create_task(asyncio.to_thread(_execute_step3_pipeline, job_id))
+
+
 # ── app ──────────────────────────────────────────────────────────────────────
 
 
@@ -751,6 +892,65 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _add_ngrok_skip_header(request, call_next):
+    """Stop ngrok's free-tier interstitial from intercepting page loads / API calls."""
+    response = await call_next(request)
+    response.headers["ngrok-skip-browser-warning"] = "true"
+    return response
+
+
+# Serve the frontend. The directory is mori/frontend/, resolved from this file's
+# location so it works regardless of the directory uvicorn is launched from.
+FRONTEND_DIR = BASE_DIR.parent / "frontend"
+app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+
+
+@app.get("/")
+async def serve_index():
+    return FileResponse(str(FRONTEND_DIR / "index.html"))
+
+
+# The pages link to each other with relative paths (e.g. href="step1.html"), which
+# resolve to /step1.html etc. — serve each HTML file explicitly so those links work.
+@app.get("/index.html")
+async def serve_index_html():
+    return FileResponse(str(FRONTEND_DIR / "index.html"))
+
+
+@app.get("/step1.html")
+async def serve_step1_html():
+    return FileResponse(str(FRONTEND_DIR / "step1.html"))
+
+
+@app.get("/step2.html")
+async def serve_step2_html():
+    return FileResponse(str(FRONTEND_DIR / "step2.html"))
+
+
+@app.get("/step3.html")
+async def serve_step3_html():
+    return FileResponse(str(FRONTEND_DIR / "step3.html"))
+
+
+@app.get("/step4.html")
+async def serve_step4_html():
+    return FileResponse(str(FRONTEND_DIR / "step4.html"))
+
+
+# The HTML pages also reference these assets with relative paths (href="style.css",
+# src="app.js"), so serve them at the root too — otherwise pages load unstyled and
+# step4.html's logic never loads.
+@app.get("/style.css")
+async def serve_style_css():
+    return FileResponse(str(FRONTEND_DIR / "style.css"))
+
+
+@app.get("/app.js")
+async def serve_app_js():
+    return FileResponse(str(FRONTEND_DIR / "app.js"))
 
 
 @app.on_event("startup")
@@ -1047,4 +1247,112 @@ async def list_step2_jobs():
         }
         for j in sorted(jobs.values(), key=lambda x: x.created_at, reverse=True)
         if j.step == "step2"
+    ]
+
+
+# ── Step 3 (email finder) endpoints — prefix /api/step3/ ─────────────────────────
+
+
+def _tomba_keys_present() -> bool:
+    """Both Tomba credentials must be available in the environment (from .env)."""
+    return bool(os.environ.get("TOMBA_API_KEY") and os.environ.get("TOMBA_SECRET"))
+
+
+def _mark_missing_keys(job: JobState) -> None:
+    job.status = "error"
+    job.error = "TOMBA_API_KEY or TOMBA_SECRET not set in .env"
+    job.message = "TOMBA_API_KEY or TOMBA_SECRET not set in .env"
+
+
+@app.post("/api/step3/run")
+async def run_step3(file: UploadFile = File(...)):
+    if _is_running():
+        raise HTTPException(status_code=409, detail="Another job is currently running.")
+
+    if not (file.filename or "").lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Please upload an .xlsx file.")
+
+    job_id = str(uuid.uuid4())
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    # Tag this job dir as a Step 3 job so it reloads correctly after a restart.
+    (job_dir / STEP3_MARKER).write_text("step3", encoding="utf-8")
+
+    input_path = job_dir / "input.xlsx"
+    with input_path.open("wb") as out:
+        shutil.copyfileobj(file.file, out)
+
+    jobs[job_id] = JobState(job_id=job_id, status="queued", message="Queued", step="step3")
+
+    if not _tomba_keys_present():
+        _mark_missing_keys(jobs[job_id])
+        return {"job_id": job_id, "status": "error"}
+
+    _launch_step3(job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.post("/api/step3/resume/{job_id}")
+async def resume_step3(job_id: str):
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if _is_running():
+        raise HTTPException(status_code=409, detail="Another job is currently running.")
+
+    job_dir = JOBS_DIR / job_id
+    if not (job_dir / "input.xlsx").exists():
+        raise HTTPException(status_code=404, detail="Job input file missing on disk.")
+
+    if not _tomba_keys_present():
+        _mark_missing_keys(job)
+        return {"job_id": job_id, "status": "error"}
+
+    job.status = "queued"
+    job.message = "Queued (resume)"
+    job.error = None
+    _launch_step3(job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/api/step3/status/{job_id}")
+async def status_step3(job_id: str):
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "message": job.message,
+        "summary": job.summary,
+    }
+
+
+@app.get("/api/step3/download/{job_id}")
+async def download_step3(job_id: str):
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job.status != "complete" or job.output_path is None or not job.output_path.exists():
+        raise HTTPException(status_code=404, detail="Output not ready.")
+    return FileResponse(
+        path=str(job.output_path),
+        filename=job.output_path.name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.get("/api/step3/jobs")
+async def list_step3_jobs():
+    return [
+        {
+            "job_id": j.job_id,
+            "status": j.status,
+            "message": j.message,
+            "summary": j.summary,
+            "created_at": j.created_at.isoformat(),
+        }
+        for j in sorted(jobs.values(), key=lambda x: x.created_at, reverse=True)
+        if j.step == "step3"
     ]

@@ -40,13 +40,17 @@ backend/jobs/{job_id}/
 ```
 mori/
 ├── backend/
-│   ├── main.py              # FastAPI app
+│   ├── main.py              # FastAPI app (also serves the frontend)
 │   ├── requirements.txt
-│   ├── .env                 # ANTHROPIC_API_KEY
+│   ├── .env                 # ANTHROPIC_API_KEY, SGAI_API_KEY, TOMBA_API_KEY, TOMBA_SECRET
 │   ├── jobs/                # per-job working directories (created at runtime)
-│   └── pipeline/            # the four-phase pipeline
+│   └── pipeline/            # pipeline scripts for Steps 1–4
 └── frontend/
     ├── index.html
+    ├── step1.html
+    ├── step2.html
+    ├── step3.html
+    ├── step4.html
     ├── style.css
     └── app.js
 ```
@@ -77,31 +81,43 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 ## Run
 
-Start the backend from the `mori/` directory:
+The frontend is now served **directly by FastAPI** — there is no separate
+frontend server to start. Only **one command** is needed:
 
 ```bash
-uvicorn backend.main:app --reload --app-dir mori
+uvicorn backend.main:app --reload
 ```
 
-> If you are **already inside** the `mori/` directory, drop `--app-dir`:
->
-> ```bash
-> uvicorn backend.main:app --reload
-> ```
+Then open <http://localhost:8000> in your browser. The backend serves
+`index.html` at `/`, each page at `/step1.html` … `/step4.html`, and the shared
+assets (`/style.css`, `/app.js`). The whole `frontend/` directory is also mounted
+at `/static/` (e.g. `/static/style.css`).
 
-The API is served at `http://localhost:8000`.
+## Sharing externally via ngrok
 
-Then open the frontend — it talks to `http://localhost:8000` (CORS is open):
+To share the app with external users, expose the single FastAPI port with
+[ngrok](https://ngrok.com). Only **one tunnel** is needed — the frontend and API
+are on the same origin:
 
 ```bash
-# simplest: just open the file
-open frontend/index.html            # macOS
-xdg-open frontend/index.html        # Linux
-
-# or serve it on its own port
-python -m http.server 5500 --directory frontend
-# then visit http://localhost:5500
+ngrok http 8000
 ```
+
+ngrok prints a public URL (e.g. `https://abcd-1234.ngrok-free.app`); open it in a
+browser and the whole app works through it.
+
+- **No client-side configuration is needed.** The
+  `ngrok-skip-browser-warning` header middleware is **already built in** to the
+  backend, so ngrok's free-tier interstitial warning page never intercepts the
+  page load or any API call, on any browser.
+- **Free ngrok URLs change on every restart.** Each time you restart `ngrok`,
+  send the new URL to anyone who needs access.
+
+## API base URL
+
+The frontend uses `window.location.origin` dynamically as its API base URL, so it
+works on **localhost, an ngrok URL, or any other domain** with no code changes —
+every request goes back to whatever host served the page.
 
 ## Using the app
 
@@ -366,6 +382,10 @@ Page title and website content come from Step 1's `sgai_url_checkpoint.json`,
 matched to each row by URL. Rows with no scraped content fall back to
 name + url + title; rows with no checkpoint at all fall back to name + url.
 
+**Required columns.** The classifier reads `found_url` and `Company Number`
+directly from every row, so both columns must be present in the uploaded
+workbook. `Business Name` is read as a signal when present.
+
 ## The two modes
 
 | Mode           | Rows        | API          | Speed                | Cost          |
@@ -479,3 +499,147 @@ button.
 > while any Step 1 / Step 2 / Step 4 job is running returns HTTP `409`. A
 > `batch_submitted` job is **not** "running" — the batch is on Anthropic's
 > servers — so you can start other work while it processes.
+
+---
+
+# Step 3 — Email Finder
+
+An independent step that finds **work emails** for contacts via the
+**[Tomba](https://tomba.io) Email Finder API**. You upload an Excel file of
+contacts and the backend looks up each person at their company domain, returning
+a workbook split into rows where an email was found and rows where none was. It
+is reached from the landing page (`frontend/index.html`) via the
+**Step 3 — Email Finder** card, which opens `frontend/step3.html`.
+
+The pipeline script lives at `backend/pipeline/tomba_email_finder.py`. Only
+**work/company emails** are kept — Tomba's email-finder endpoint returns work
+emails by design, and any personal-domain hits (gmail, yahoo, outlook, …) are
+discarded.
+
+## Required input columns
+
+Every sheet in the uploaded workbook is processed automatically. Each sheet needs
+three columns (sheets missing any of them are skipped):
+
+| Column      | Purpose                                          |
+|-------------|--------------------------------------------------|
+| `Fname`     | Contact first name                               |
+| `Sname`     | Contact surname                                  |
+| `found_url` | Company website/domain (the Step 1 output column)|
+
+Rows with a missing name or an unparseable domain are skipped (counted as
+"no email").
+
+## `TOMBA_API_KEY` / `TOMBA_SECRET`
+
+Step 3 calls the Tomba API, which needs **two** credentials. Add them to
+`backend/.env` alongside the existing keys:
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
+SGAI_API_KEY=your_scrapegraphai_api_key
+TOMBA_API_KEY=ta_...
+TOMBA_SECRET=ts_...
+```
+
+The backend loads `.env` and sets both into the environment before running the
+pipeline. If **either** is missing, the job ends immediately in **error** with
+the message `TOMBA_API_KEY or TOMBA_SECRET not set in .env`.
+
+## Checkpoint & resume
+
+Like the other steps, each upload becomes a **job** with a UUID directory under
+`backend/jobs/{job_id}/`. The pipeline writes a per-row checkpoint
+(`input_tomba_checkpoint.json`) as it goes, so an interrupted job is **safe to
+resume** without re-spending Tomba lookups — resuming simply re-reads the
+checkpoint and continues from the last completed row.
+
+The checkpoint is **deleted on a fully successful run**. So a job directory with
+a checkpoint but no output means the job was interrupted; the Step 3 page shows
+it as a **resumable** card.
+
+```
+backend/jobs/{job_id}/
+├── .step3                        # marker tagging this as a Step 3 job
+├── input.xlsx                    # uploaded workbook (never modified)
+├── input_tomba_checkpoint.json   # per-row checkpoint (deleted on success)
+└── output/
+    └── input_tomba.xlsx          # final output — served for download
+```
+
+## Rate limiting
+
+Lookups are throttled with a sliding-window rate limiter, default
+**60 requests/min** (the Tomba free tier). Raise it via `RATE_LIMIT_PER_MIN` in
+`tomba_email_finder.py` if your plan allows more. Up to `MAX_WORKERS` (5) lookups
+run concurrently under that limit.
+
+## Output structure
+
+The input file is **never modified**. The output workbook has **two sheets per
+source sheet**:
+
+- `{sheet}_email` — rows where Tomba found a work email.
+- `{sheet}_no_email` — rows where Tomba found nothing.
+
+Each row gains **four columns**:
+
+| Column               | Meaning                                             |
+|----------------------|-----------------------------------------------------|
+| `Tomba_Email`        | The discovered work email.                          |
+| `Tomba_Confidence`   | Tomba's confidence score for the email.             |
+| `Tomba_Verification` | Verification status returned by Tomba.              |
+| `Tomba_Position`     | The contact's job title/position, if returned.      |
+
+## Output summary
+
+When a Step 3 job reaches `complete`, `GET /api/step3/status/{job_id}` includes a
+`summary`:
+
+```jsonc
+{
+  "job_id": "…",
+  "status": "complete",
+  "message": "Complete",
+  "summary": {
+    "sheets_processed": 3,
+    "total_rows": 350,
+    "emails_found": 180,
+    "no_email": 170
+  }
+}
+```
+
+The frontend renders this as a results card below the **Download Output** button.
+
+## Step 3 API reference — prefix `/api/step3/`
+
+| Method | Endpoint                       | Purpose                                                                 |
+|--------|--------------------------------|-------------------------------------------------------------------------|
+| POST   | `/api/step3/run`               | Upload `.xlsx`, start a job (`409` if any job is busy). Returns `error` immediately if Tomba keys are missing |
+| POST   | `/api/step3/resume/{job_id}`   | Resume an interrupted job from its checkpoint (`404`/`409`)             |
+| GET    | `/api/step3/status/{job_id}`   | `{ job_id, status, message, summary }` — `message` carries live per-row progress; `summary` is `null` until `complete` |
+| GET    | `/api/step3/download/{job_id}` | Stream `input_tomba.xlsx` (`404` if not ready)                          |
+| GET    | `/api/step3/jobs`              | List all Step 3 jobs (for the resume UI)                                |
+
+> **One job at a time across all steps.** Starting or resuming a Step 3 job while
+> any Step 1 / Step 2 / Step 4 job is running returns HTTP `409`.
+
+---
+
+# Required Column Names
+
+Each step expects specific columns in the uploaded `.xlsx`. The Required Columns
+info box on each step page mirrors this table.
+
+| Step | Required columns | Optional columns | Matching |
+|------|------------------|------------------|----------|
+| **Step 1 — URL Discovery** | `Business Name` | — | case-insensitive; the name column is auto-detected from any column containing "name", "company", or "business" |
+| **Step 2 — Sector Classification** | `found_url`, `Company Number` | `Business Name` (classification signal) | exact (case-sensitive) |
+| **Step 3 — Email Finder** | `Fname`, `Sname`, `found_url` | — | exact (case-sensitive) |
+| **Step 4 — Address Validation** | `website` | `add1`, `add2`, `town`, `county`, `postcode` (used for comparison if present) | case-insensitive |
+
+> If a required column is missing or named differently, the job will fail —
+> rename the column in your Excel file before uploading. The **matching** column
+> above reflects what each pipeline actually does: Steps 1 and 4 match column
+> names case-insensitively, while Steps 2 and 3 read exact, case-sensitive names.
