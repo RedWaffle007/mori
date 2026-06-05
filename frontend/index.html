@@ -3,53 +3,56 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Step 4 — Address Validation</title>
+  <title>Data Enrichment Pipeline</title>
   <link rel="stylesheet" href="style.css" />
+  <style>
+    /* Hub-specific styles (style.css is shared and left untouched). */
+    .step-list { display: flex; flex-direction: column; gap: 12px; }
+    .step-card {
+      display: block;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 18px;
+      text-decoration: none;
+      color: var(--text);
+      background: #fafbfc;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    .step-card:hover {
+      border-color: var(--text);
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+    }
+    .step-card-title { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+    .step-card-desc { font-size: 14px; color: var(--muted); margin: 0; line-height: 1.5; }
+  </style>
 </head>
 <body>
   <main class="card">
     <header>
-      <h1>Step 4 — Address Validation</h1>
+      <h1>Data Enrichment Pipeline</h1>
       <p class="subtitle">
-        Upload an Excel file of companies. Each website is scraped to validate
-        and extract UK addresses, and a validated workbook is returned.
+        Choose a step to run. Each step takes an Excel file and returns an
+        enriched workbook you can download.
       </p>
     </header>
 
-    <!-- Resumable (interrupted) jobs -->
-    <section id="resume-section" class="hidden">
-      <h2>Resumable jobs</h2>
-      <div id="resume-list"></div>
-    </section>
-
-    <!-- New upload -->
-    <section id="upload-section">
-      <h2>New job</h2>
-      <label class="file-field">
-        <input type="file" id="file-input" accept=".xlsx" />
-      </label>
-      <button id="run-btn" type="button">Run Step 4</button>
-      <p id="upload-error" class="error hidden"></p>
-    </section>
-
-    <!-- Active job status -->
-    <section id="status-section" class="hidden">
-      <h2>Job status</h2>
-      <div class="job-id-row">
-        <span class="label">Job ID:</span>
-        <code id="job-id"></code>
+    <section id="steps-section">
+      <h2>Steps</h2>
+      <div class="step-list">
+        <a class="step-card" href="step1.html">
+          <div class="step-card-title">Step 1 — URL Discovery</div>
+          <p class="step-card-desc">
+            Find company websites from a list of business names.
+          </p>
+        </a>
+        <a class="step-card" href="step4.html">
+          <div class="step-card-title">Step 4 — Address Validation</div>
+          <p class="step-card-desc">
+            Validate postal addresses from known company websites.
+          </p>
+        </a>
       </div>
-      <div id="status-row" class="status-row">
-        <span id="spinner" class="spinner hidden"></span>
-        <span id="status-badge" class="badge"></span>
-        <span id="status-message" class="status-message"></span>
-      </div>
-      <p id="job-error" class="error hidden"></p>
-      <a id="download-btn" class="download-btn hidden" href="#">Download Output</a>
-      <div id="summary-card" class="summary-card hidden"></div>
     </section>
   </main>
-
-  <script src="app.js"></script>
 </body>
 </html>

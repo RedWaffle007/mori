@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Step 1 — URL Discovery</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    .back-link { margin: 0 0 14px; font-size: 13px; }
+    .back-link a { color: var(--muted); text-decoration: none; }
+    .back-link a:hover { color: var(--text); }
+    /* Two-part summary headings already covered by .summary-card h3 in style.css */
+  </style>
+</head>
+<body>
+  <main class="card">
+    <header>
+      <p class="back-link"><a href="index.html">← All steps</a></p>
+      <h1>Step 1 — URL Discovery</h1>
+      <p class="subtitle">
+        Upload an Excel file of business names. A two-stage pipeline searches for
+        each company's website (Stage 1) and then re-evaluates the low-confidence
+        matches with an improved name matcher (Stage 2). A workbook of discovered
+        URLs is returned.
+      </p>
+    </header>
+
+    <!-- Resumable (interrupted) jobs -->
+    <section id="resume-section" class="hidden">
+      <h2>Resumable jobs</h2>
+      <div id="resume-list"></div>
+    </section>
+
+    <!-- New upload -->
+    <section id="upload-section">
+      <h2>New job</h2>
+      <label class="file-field">
+        <input type="file" id="file-input" accept=".xlsx" />
+      </label>
+      <button id="run-btn" type="button">Run Step 1</button>
+      <p id="upload-error" class="error hidden"></p>
+    </section>
+
+    <!-- Active job status -->
+    <section id="status-section" class="hidden">
+      <h2>Job status</h2>
+      <div class="job-id-row">
+        <span class="label">Job ID:</span>
+        <code id="job-id"></code>
+      </div>
+      <div id="status-row" class="status-row">
+        <span id="spinner" class="spinner hidden"></span>
+        <span id="status-badge" class="badge"></span>
+        <span id="status-message" class="status-message"></span>
+      </div>
+      <p id="job-error" class="error hidden"></p>
+      <a id="download-btn" class="download-btn hidden" href="#">Download Output</a>
+      <div id="summary-card" class="summary-card hidden"></div>
+    </section>
+  </main>
+
+  <script>
+    // ── config ────────────────────────────────────────────────────────────────
+    const API_BASE = "http://localhost:8000";
+    const POLL_INTERVAL_MS = 4000;
+
+    // ── elements ──────────────────────────────────────────────────────────────
+    const els = {
+      resumeSection: document.getElementById("resume-section"),
+      resumeList: document.getElementById("resume-list"),
+      fileInput: document.getElementById("file-input"),
+      runBtn: document.getElementById("run-btn"),
+      uploadError: document.getElementById("upload-error"),
+      statusSection: document.getElementById("status-section"),
+      jobId: document.getElementById("job-id"),
+      spinner: document.getElementById("spinner"),
+      statusBadge: document.getElementById("status-badge"),
+      statusMessage: document.getElementById("status-message"),
+      jobError: document.getElementById("job-error"),
+      downloadBtn: document.getElementById("download-btn"),
+      summaryCard: document.getElementById("summary-card"),
+    };
+
+    let pollTimer = null;
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+    function show(el) { el.classList.remove("hidden"); }
+    function hide(el) { el.classList.add("hidden"); }
+
+    function setBadge(status) {
+      els.statusBadge.textContent = status;
+      els.statusBadge.className = "badge " + status;
+    }
+
+    // ── interrupted jobs on load ────────────────────────────────────────────────
+    async function loadJobs() {
+      try {
+        const res = await fetch(`${API_BASE}/api/step1url/jobs`);
+        if (!res.ok) return;
+        const jobs = await res.json();
+        const resumable = jobs.filter((j) => j.status === "interrupted");
+
+        els.resumeList.innerHTML = "";
+        if (resumable.length === 0) {
+          hide(els.resumeSection);
+          return;
+        }
+
+        resumable.forEach((job) => {
+          const card = document.createElement("div");
+          card.className = "resume-card";
+
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.innerHTML = `<div>${job.message}</div><code>${job.job_id}</code>`;
+
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.textContent = "Resume";
+          btn.addEventListener("click", () => resumeJob(job.job_id));
+
+          card.appendChild(meta);
+          card.appendChild(btn);
+          els.resumeList.appendChild(card);
+        });
+        show(els.resumeSection);
+      } catch (err) {
+        // backend not reachable — leave resume section hidden
+        console.error("Failed to load jobs:", err);
+      }
+    }
+
+    // ── run a new job ────────────────────────────────────────────────────────────
+    async function runJob() {
+      hide(els.uploadError);
+      const file = els.fileInput.files[0];
+      if (!file) {
+        els.uploadError.textContent = "Please choose an .xlsx file first.";
+        show(els.uploadError);
+        return;
+      }
+
+      const form = new FormData();
+      form.append("file", file);
+
+      els.runBtn.disabled = true;
+      try {
+        const res = await fetch(`${API_BASE}/api/step1url/run`, {
+          method: "POST",
+          body: form,
+        });
+        if (res.status === 409) {
+          els.uploadError.textContent = "Another job is already running. Please wait for it to finish.";
+          show(els.uploadError);
+          return;
+        }
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({}));
+          els.uploadError.textContent = detail.detail || `Upload failed (${res.status}).`;
+          show(els.uploadError);
+          return;
+        }
+        const data = await res.json();
+        startTracking(data.job_id);
+      } catch (err) {
+        els.uploadError.textContent = "Could not reach the server.";
+        show(els.uploadError);
+      } finally {
+        els.runBtn.disabled = false;
+      }
+    }
+
+    // ── resume an interrupted job ────────────────────────────────────────────────
+    async function resumeJob(jobId) {
+      try {
+        const res = await fetch(`${API_BASE}/api/step1url/resume/${jobId}`, { method: "POST" });
+        if (res.status === 409) {
+          alert("Another job is already running. Please wait for it to finish.");
+          return;
+        }
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({}));
+          alert(detail.detail || `Resume failed (${res.status}).`);
+          return;
+        }
+        hide(els.resumeSection);
+        startTracking(jobId);
+      } catch (err) {
+        alert("Could not reach the server.");
+      }
+    }
+
+    // ── status tracking ──────────────────────────────────────────────────────────
+    function startTracking(jobId) {
+      if (pollTimer) clearInterval(pollTimer);
+
+      show(els.statusSection);
+      els.jobId.textContent = jobId;
+      hide(els.jobError);
+      hide(els.downloadBtn);
+      hide(els.summaryCard);
+      els.summaryCard.innerHTML = "";
+      setBadge("queued");
+      els.statusMessage.textContent = "Queued…";
+      show(els.spinner);
+
+      poll(jobId);
+      pollTimer = setInterval(() => poll(jobId), POLL_INTERVAL_MS);
+    }
+
+    async function poll(jobId) {
+      try {
+        const res = await fetch(`${API_BASE}/api/step1url/status/${jobId}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        renderStatus(jobId, data);
+      } catch (err) {
+        // transient network error — keep polling
+      }
+    }
+
+    function renderStatus(jobId, data) {
+      setBadge(data.status);
+      els.statusMessage.textContent = data.message || "";
+
+      if (data.status === "complete") {
+        clearInterval(pollTimer);
+        hide(els.spinner);
+        els.downloadBtn.href = `${API_BASE}/api/step1url/download/${jobId}`;
+        show(els.downloadBtn);
+        renderSummary(data.summary);
+      } else if (data.status === "error") {
+        clearInterval(pollTimer);
+        hide(els.spinner);
+        els.jobError.textContent = data.message || "The job failed.";
+        show(els.jobError);
+      } else {
+        // queued / running
+        show(els.spinner);
+      }
+    }
+
+    // ── two-part summary card ────────────────────────────────────────────────────
+    function renderSummary(summary) {
+      if (!summary || !summary.stage1 || !summary.stage2) {
+        hide(els.summaryCard);
+        return;
+      }
+      const s1 = summary.stage1;
+      const s2 = summary.stage2;
+      const n = (v) => Number(v || 0).toLocaleString();
+
+      els.summaryCard.innerHTML = `
+        <h3>Stage 1 — URL Discovery</h3>
+        <table class="summary-table">
+          <tr><td>HIGH confidence</td><td>${n(s1.high)}</td></tr>
+          <tr><td>MEDIUM confidence</td><td>${n(s1.medium)}</td></tr>
+          <tr><td>LOW</td><td>${n(s1.low)}</td></tr>
+          <tr><td>Discard</td><td>${n(s1.discard)}</td></tr>
+          <tr class="total-row"><td>Total</td><td>${n(s1.total)}</td></tr>
+        </table>
+        <h3>Stage 2 — Low Promoter</h3>
+        <table class="summary-table">
+          <tr><td>Promoted to HIGH</td><td>${n(s2.promoted_high)}</td></tr>
+          <tr><td>Promoted to MEDIUM</td><td>${n(s2.promoted_medium)}</td></tr>
+          <tr><td>Remaining LOW</td><td>${n(s2.remaining_low)}</td></tr>
+          <tr><td>Discard</td><td>${n(s2.discard)}</td></tr>
+          <tr class="total-row"><td>Final with URL</td><td>${n(s2.final_with_url)}</td></tr>
+        </table>
+      `;
+      show(els.summaryCard);
+    }
+
+    // ── init ──────────────────────────────────────────────────────────────────────
+    els.runBtn.addEventListener("click", runJob);
+    loadJobs();
+  </script>
+</body>
+</html>

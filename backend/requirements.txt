@@ -6,3 +6,5 @@ pandas
 openpyxl
 anthropic
 scrapegraphai
+requests
+tqdm

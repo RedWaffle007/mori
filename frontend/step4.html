@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Step 4 — Address Validation</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    .back-link { margin: 0 0 14px; font-size: 13px; }
+    .back-link a { color: var(--muted); text-decoration: none; }
+    .back-link a:hover { color: var(--text); }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <header>
+      <p class="back-link"><a href="index.html">← All steps</a></p>
+      <h1>Step 4 — Address Validation</h1>
+      <p class="subtitle">
+        Upload an Excel file of companies. Each website is scraped to validate
+        and extract UK addresses, and a validated workbook is returned.
+      </p>
+    </header>
+
+    <!-- Resumable (interrupted) jobs -->
+    <section id="resume-section" class="hidden">
+      <h2>Resumable jobs</h2>
+      <div id="resume-list"></div>
+    </section>
+
+    <!-- New upload -->
+    <section id="upload-section">
+      <h2>New job</h2>
+      <label class="file-field">
+        <input type="file" id="file-input" accept=".xlsx" />
+      </label>
+      <button id="run-btn" type="button">Run Step 4</button>
+      <p id="upload-error" class="error hidden"></p>
+    </section>
+
+    <!-- Active job status -->
+    <section id="status-section" class="hidden">
+      <h2>Job status</h2>
+      <div class="job-id-row">
+        <span class="label">Job ID:</span>
+        <code id="job-id"></code>
+      </div>
+      <div id="status-row" class="status-row">
+        <span id="spinner" class="spinner hidden"></span>
+        <span id="status-badge" class="badge"></span>
+        <span id="status-message" class="status-message"></span>
+      </div>
+      <p id="job-error" class="error hidden"></p>
+      <a id="download-btn" class="download-btn hidden" href="#">Download Output</a>
+      <div id="summary-card" class="summary-card hidden"></div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
