@@ -47,7 +47,7 @@ def _scan_excel(input_file: Path) -> dict:
     df = pd.read_excel(input_file)
 
     website_col = next(
-        (c for c in df.columns if c.strip().lower() == "website"),
+        (c for c in df.columns if c.strip().lower() == "found_url"),
         None,
     )
     status_col = next(

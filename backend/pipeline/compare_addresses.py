@@ -421,7 +421,7 @@ def run(
         )
 
     website_col = next(
-        (c for c in df.columns if c.strip().lower() == "website"),
+        (c for c in df.columns if c.strip().lower() == "found_url"),
         None,
     )
 

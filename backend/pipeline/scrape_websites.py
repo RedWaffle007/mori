@@ -201,13 +201,13 @@ def run(
 ) -> dict[str, str]:
     df = pd.read_excel(input_file)
 
-    # accept "website" or "Website"
+    # accept "found_url" or "Found_URL" (case-insensitive)
     website_col = next(
-        (c for c in df.columns if c.strip().lower() == "website"),
+        (c for c in df.columns if c.strip().lower() == "found_url"),
         None,
     )
     if website_col is None:
-        raise ValueError("No 'website' column found in the Excel file.")
+        raise ValueError("No 'found_url' column found in the Excel file.")
 
     # Best-effort company name column for progress reporting
     name_col = None

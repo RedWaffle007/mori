@@ -207,10 +207,10 @@ def enrich_sheet(df: pd.DataFrame, sheet_name: str,
         try:
             idx_int = int(idx_str)
             if res.get("email"):
-                df.at[idx_int, COL_EMAIL] = res.get("email", "")
-                df.at[idx_int, COL_CONFIDENCE] = res.get("confidence", "")
-                df.at[idx_int, COL_VERIFICATION] = res.get("verification", "")
-                df.at[idx_int, COL_POSITION] = res.get("position", "")
+                df.at[idx_int, COL_EMAIL] = str(res.get("email", ""))
+                df.at[idx_int, COL_CONFIDENCE] = str(res.get("confidence", ""))
+                df.at[idx_int, COL_VERIFICATION] = str(res.get("verification", ""))
+                df.at[idx_int, COL_POSITION] = str(res.get("position", ""))
         except Exception:
             pass
 
@@ -265,10 +265,10 @@ def enrich_sheet(df: pd.DataFrame, sheet_name: str,
                 res = fut.result()
 
                 if res["email"] and res["email"] != "NO_KEY":
-                    df.at[idx, COL_EMAIL] = res["email"]
-                    df.at[idx, COL_CONFIDENCE] = res["confidence"]
-                    df.at[idx, COL_VERIFICATION] = res["verification"]
-                    df.at[idx, COL_POSITION] = res["position"]
+                    df.at[idx, COL_EMAIL] = str(res["email"])
+                    df.at[idx, COL_CONFIDENCE] = str(res["confidence"])
+                    df.at[idx, COL_VERIFICATION] = str(res["verification"])
+                    df.at[idx, COL_POSITION] = str(res["position"])
                     hits += 1
                 else:
                     misses += 1
