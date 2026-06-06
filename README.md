@@ -138,6 +138,20 @@ every request goes back to whatever host served the page.
 Only **one job runs at a time** — starting/resuming while another is running
 returns HTTP `409`.
 
+### Auto-reconnect to a running job
+
+Every step page (Steps 1–4) automatically reconnects to an in-progress job, so
+you never lose sight of work that is still running on the backend:
+
+- **Navigating away and returning** (e.g. to the home page and back) — on load
+  the page fetches its jobs list, detects any job still in a **running** state
+  (`queued` / `running`, plus `batch_submitted` for Step 2) and restores the
+  in-progress UI, resuming status polling as if you never left.
+- **Refreshing the page** — the active job ID is also persisted to
+  `localStorage` (keyed per step, e.g. `step1_active_job`), so a full reload
+  recovers the same job. The stored ID is cleared automatically when the job
+  reaches a terminal state (**complete** or **error**).
+
 ## Cost tracking
 
 Both API-calling phases are priced at **Haiku 4.5 batch rates**:

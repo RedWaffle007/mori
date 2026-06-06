@@ -2,6 +2,7 @@
 // Same origin the page was served from — works locally, via ngrok, or any domain.
 const API_BASE = window.location.origin;
 const POLL_INTERVAL_MS = 4000;
+const ACTIVE_JOB_KEY = "step4_active_job";
 
 // ── elements ────────────────────────────────────────────────────────────────
 const els = {
@@ -39,6 +40,10 @@ async function loadJobs() {
     });
     if (!res.ok) return;
     const jobs = await res.json();
+
+    // Reconnect to a job that is still running (user navigated away / reloaded).
+    maybeReconnect(jobs);
+
     const resumable = jobs.filter((j) => j.status === "interrupted");
 
     els.resumeList.innerHTML = "";
@@ -68,6 +73,25 @@ async function loadJobs() {
   } catch (err) {
     // backend not reachable — leave resume section hidden
     console.error("Failed to load jobs:", err);
+  }
+}
+
+// ── reconnect to an in-progress job ────────────────────────────────────────────
+function isActiveStatus(status) {
+  return status === "queued" || status === "running";
+}
+
+function maybeReconnect(jobs) {
+  const storedId = localStorage.getItem(ACTIVE_JOB_KEY);
+  // Prefer the job we persisted before leaving; otherwise any job the server
+  // still reports as active.
+  const active =
+    jobs.find((j) => j.job_id === storedId && isActiveStatus(j.status)) ||
+    jobs.find((j) => isActiveStatus(j.status));
+  if (active) {
+    startTracking(active.job_id);
+  } else {
+    localStorage.removeItem(ACTIVE_JOB_KEY);
   }
 }
 
@@ -135,6 +159,7 @@ async function resumeJob(jobId) {
 // ── status tracking ────────────────────────────────────────────────────────────
 function startTracking(jobId) {
   if (pollTimer) clearInterval(pollTimer);
+  localStorage.setItem(ACTIVE_JOB_KEY, jobId);
 
   show(els.statusSection);
   els.jobId.textContent = jobId;
@@ -169,12 +194,14 @@ function renderStatus(jobId, data) {
 
   if (data.status === "complete") {
     clearInterval(pollTimer);
+    localStorage.removeItem(ACTIVE_JOB_KEY);
     hide(els.spinner);
     els.downloadBtn.href = `${API_BASE}/api/step1/download/${jobId}`;
     show(els.downloadBtn);
     renderSummary(data.summary);
   } else if (data.status === "error") {
     clearInterval(pollTimer);
+    localStorage.removeItem(ACTIVE_JOB_KEY);
     hide(els.spinner);
     els.jobError.textContent = data.message || "The job failed.";
     show(els.jobError);
