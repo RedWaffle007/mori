@@ -167,7 +167,7 @@ def _find_step2_output(job_dir: Path) -> Path | None:
 
 
 def _step2_summary(output_path: Path, mode: str) -> dict:
-    """Tally the four sector sheets of a completed classification workbook."""
+    """Tally the six sector sheets of a completed classification workbook."""
     xl = pd.ExcelFile(output_path)
 
     def count(sheet: str) -> int:
@@ -175,16 +175,20 @@ def _step2_summary(output_path: Path, mode: str) -> dict:
             return 0
         return len(pd.read_excel(xl, sheet_name=sheet, dtype=str))
 
-    cyber = count("cyber")
-    msp = count("MSP")
-    telecom = count("telecom")
+    security = count("security")
+    msp = count("MSP V")
+    integration = count("integration")
+    support = count("support")
+    infrastructure = count("infrastructure")
     other = count("other")
     return {
         "mode": mode,
-        "rows_classified": cyber + msp + telecom + other,
-        "cyber": cyber,
+        "rows_classified": security + msp + integration + support + infrastructure + other,
+        "security": security,
         "msp": msp,
-        "telecom": telecom,
+        "integration": integration,
+        "support": support,
+        "infrastructure": infrastructure,
         "other": other,
     }
 

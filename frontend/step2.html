@@ -71,9 +71,9 @@
       <p class="back-link"><a href="index.html">← All steps</a></p>
       <h1>Step 2 — Sector Classification</h1>
       <p class="subtitle">
-        Classify companies into <strong>MSP IT Services</strong>,
-        <strong>Cybersecurity Services</strong>,
-        <strong>Telecom / Connectivity Services</strong>, or <strong>Other</strong>
+        Classify companies into <strong>Security</strong>, <strong>MSP V</strong>,
+        <strong>Integration</strong>, <strong>Support</strong>,
+        <strong>Infrastructure</strong>, or <strong>Other</strong>
         using Claude. Upload the promoted workbook from Step 1 and link the Step 1
         job so its scraped website content can be used as a signal.
       </p>
@@ -493,9 +493,11 @@
       els.summaryCard.innerHTML = `
         <h3>${heading}</h3>
         <table class="summary-table">
-          <tr><td>Cybersecurity Services</td><td>${n(summary.cyber)}</td></tr>
-          <tr><td>MSP IT Services</td><td>${n(summary.msp)}</td></tr>
-          <tr><td>Telecom / Connectivity</td><td>${n(summary.telecom)}</td></tr>
+          <tr><td>Security</td><td>${n(summary.security)}</td></tr>
+          <tr><td>MSP V</td><td>${n(summary.msp)}</td></tr>
+          <tr><td>Integration</td><td>${n(summary.integration)}</td></tr>
+          <tr><td>Support</td><td>${n(summary.support)}</td></tr>
+          <tr><td>Infrastructure</td><td>${n(summary.infrastructure)}</td></tr>
           <tr><td>Other</td><td>${n(summary.other)}</td></tr>
           <tr class="total-row"><td>Total</td><td>${n(summary.rows_classified)}</td></tr>
         </table>
