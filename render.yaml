@@ -4,7 +4,7 @@ services:
   - type: web
     name: neamhara-ai
     runtime: docker
-    plan: pro                      # Pro instance (required for a persistent disk).
+    plan: standard                    # Pro instance (required for a persistent disk).
     region: frankfurt              # EU region — closest to UK/Ireland users/data.
     numInstances: 1               # MUST stay 1: in-memory job state + one-job guard.
     dockerfilePath: ./Dockerfile
