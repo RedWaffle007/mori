@@ -22,4 +22,7 @@ playwright-browsers/
 
 # OS files
 .DS_Store
-Thumbs.db
+Thumbs.db*.xlsx
+*.docx
+*_audit.md
+other_sector_analysis.md
