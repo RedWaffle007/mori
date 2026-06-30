@@ -1,0 +1,23 @@
+# Secrets — never bake these into the image (env vars come from Render at runtime).
+**/.env
+**/.env.*
+
+# Job data & uploads — lives on the persistent disk at runtime, not in the image.
+backend/jobs/
+
+# Local virtualenv and Python caches.
+menv/
+.venv/
+venv/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Version control & local-only data files.
+.git/
+*.xlsx
+*.docx
+
+# Playwright browser binaries are installed inside the image, not copied in.
+playwright-browsers/
+.playwright/

@@ -7,5 +7,6 @@ openpyxl
 anthropic
 aiohttp
 scrapegraphai
+playwright==1.60.0
 requests
 tqdm

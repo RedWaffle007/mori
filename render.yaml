@@ -1,0 +1,33 @@
+# Render Infrastructure-as-Code for the data-enrichment pipeline.
+# One Docker web service serving both the FastAPI API and the static frontend.
+services:
+  - type: web
+    name: neamhara-ai
+    runtime: docker
+    plan: pro                      # Pro instance (required for a persistent disk).
+    region: frankfurt              # EU region — closest to UK/Ireland users/data.
+    numInstances: 1               # MUST stay 1: in-memory job state + one-job guard.
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /             # GET / returns index.html (200) when healthy.
+    autoDeploy: true
+
+    # Persistent disk so uploads, checkpoints and outputs survive deploys/restarts.
+    # Mounted at the exact JOBS_DIR the app uses (BASE_DIR/jobs => /app/backend/jobs).
+    disk:
+      name: jobs-data
+      mountPath: /app/backend/jobs
+      sizeGB: 10
+
+    # Secrets are entered in the Render dashboard, never committed (sync: false).
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SGAI_API_KEY
+        sync: false
+      - key: TOMBA_API_KEY
+        sync: false
+      - key: TOMBA_SECRET
+        sync: false
+      - key: TOMBA_MAX_CONSECUTIVE_5XX   # optional; app defaults to 10 if unset.
+        sync: false
