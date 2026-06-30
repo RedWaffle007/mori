@@ -29,5 +29,3 @@ services:
         sync: false
       - key: TOMBA_SECRET
         sync: false
-      - key: TOMBA_MAX_CONSECUTIVE_5XX   # optional; app defaults to 10 if unset.
-        sync: false
