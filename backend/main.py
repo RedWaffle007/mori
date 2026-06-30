@@ -14,6 +14,7 @@ survive server restarts and let interrupted jobs be resumed.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -77,6 +78,8 @@ STEP2_MARKER = ".step2"                       # marker file written when a Step 
 STEP2_CHECKPOINT = "sgai_url_checkpoint.json" # copied from the linked Step 1 job (optional)
 STEP2_BATCH_ID = "batch_id.txt"               # written by batch submit (resume marker)
 STEP2_OUTPUT = "sector_classified.xlsx"       # final output (served for download)
+STEP2_TAXONOMY = "taxonomy_id.txt"            # taxonomy chosen for this job (resume marker)
+DEFAULT_TAXONOMY_ID = "sic_80200"             # default keeps pre-existing jobs unchanged
 
 # ── Step 3 (email finder) artifacts ──────────────────────────────────────────────
 # Step 3 shares JOBS_DIR with the other steps. A hidden marker tags a job dir as a
@@ -109,6 +112,7 @@ class JobState:
     error: str | None = None
     summary: dict | None = None  # results breakdown + cost tracking (set on completion)
     mode: str | None = None  # Step 2 only: "test" | "batch"
+    taxonomy_id: str | None = None  # Step 2 only: classification scheme id (e.g. "sic_80200")
     batch_id: str | None = None  # Step 2 batch mode: Anthropic batch id (set after submission)
     created_at: datetime = field(default_factory=datetime.utcnow)
 
@@ -166,8 +170,29 @@ def _find_step2_output(job_dir: Path) -> Path | None:
     return out if out.exists() else None
 
 
-def _step2_summary(output_path: Path, mode: str) -> dict:
-    """Tally the six sector sheets of a completed classification workbook."""
+def _step2_taxonomy_id(job_dir: Path) -> str:
+    """The taxonomy id chosen for this job, read from its on-disk marker.
+
+    Defaults to DEFAULT_TAXONOMY_ID when the marker is absent so pre-existing jobs
+    (and any job created before multi-taxonomy support) classify exactly as before.
+    """
+    f = job_dir / STEP2_TAXONOMY
+    if f.exists():
+        val = f.read_text(encoding="utf-8").strip()
+        if val:
+            return val
+    return DEFAULT_TAXONOMY_ID
+
+
+def _step2_summary(output_path: Path, mode: str, taxonomy_id: str = DEFAULT_TAXONOMY_ID) -> dict:
+    """Tally the sector sheets of a completed classification workbook.
+
+    Driven by the active taxonomy's SHEET_MAP so any scheme tallies correctly. The
+    original six 80200 keys (security/msp/.../other) are kept as-is for backward
+    compatibility; `by_sector` is the taxonomy-ordered tally the UI renders from.
+    """
+    import taxonomies  # taxonomy registry (pipeline/taxonomies)
+    tax = taxonomies.get_taxonomy(taxonomy_id)
     xl = pd.ExcelFile(output_path)
 
     def count(sheet: str) -> int:
@@ -175,22 +200,26 @@ def _step2_summary(output_path: Path, mode: str) -> dict:
             return 0
         return len(pd.read_excel(xl, sheet_name=sheet, dtype=str))
 
-    security = count("security")
-    msp = count("MSP V")
-    integration = count("integration")
-    support = count("support")
-    infrastructure = count("infrastructure")
-    other = count("other")
-    return {
+    # Active-taxonomy tally: {Sector display name: row count}, ordered by SECTORS_ORDER.
+    sheet_by_sector = {sector: sheet for sheet, sector in tax.SHEET_MAP.items()}
+    by_sector = {sector: count(sheet_by_sector[sector]) for sector in tax.SECTORS_ORDER}
+    rows_classified = sum(by_sector.values())
+
+    summary = {
         "mode": mode,
-        "rows_classified": security + msp + integration + support + infrastructure + other,
-        "security": security,
-        "msp": msp,
-        "integration": integration,
-        "support": support,
-        "infrastructure": infrastructure,
-        "other": other,
+        "taxonomy_id": taxonomy_id,
+        "rows_classified": rows_classified,
+        "by_sector": by_sector,
+        # Legacy 80200 keys preserved so the existing summary path stays byte-identical
+        # for 80200 (these are simply 0 for sheets a non-80200 scheme doesn't produce).
+        "security": count("security"),
+        "msp": count("MSP V"),
+        "integration": count("integration"),
+        "support": count("support"),
+        "infrastructure": count("infrastructure"),
+        "other": count("other"),
     }
+    return summary
 
 
 def _is_step3_job(job_dir: Path) -> bool:
@@ -202,6 +231,15 @@ def _find_step3_output(job_dir: Path) -> Path | None:
     """Return the Tomba workbook if it has been produced, else None."""
     out = job_dir / "output" / STEP3_OUTPUT
     return out if out.exists() else None
+
+
+def _is_resumable_step3(job_dir: Path) -> bool:
+    """Input present, a checkpoint to resume from, and no finished output yet."""
+    return (
+        (job_dir / "input.xlsx").exists()
+        and (job_dir / STEP3_CHECKPOINT).exists()
+        and _find_step3_output(job_dir) is None
+    )
 
 
 def _step3_summary(output_path: Path) -> dict:
@@ -253,11 +291,12 @@ def _reload_url_job(job_id: str, job_dir: Path, created: datetime) -> None:
 def _reload_step2_job(job_id: str, job_dir: Path, created: datetime) -> None:
     output = _find_step2_output(job_dir)
     batch_id_file = job_dir / STEP2_BATCH_ID
+    taxonomy_id = _step2_taxonomy_id(job_dir)
     if output is not None:
         # A batch_id.txt means it ran as a batch; otherwise it was a test run.
         mode = "batch" if batch_id_file.exists() else "test"
         try:
-            summary = _step2_summary(output, mode)
+            summary = _step2_summary(output, mode, taxonomy_id)
         except Exception:  # noqa: BLE001 — summary is best-effort on reload
             summary = None
         jobs[job_id] = JobState(
@@ -266,6 +305,7 @@ def _reload_step2_job(job_id: str, job_dir: Path, created: datetime) -> None:
             message="Complete",
             step="step2",
             mode=mode,
+            taxonomy_id=taxonomy_id,
             output_path=output,
             summary=summary,
             created_at=created,
@@ -279,6 +319,7 @@ def _reload_step2_job(job_id: str, job_dir: Path, created: datetime) -> None:
             message=f"Batch submitted — ID: {batch_id}",
             step="step2",
             mode="batch",
+            taxonomy_id=taxonomy_id,
             batch_id=batch_id,
             created_at=created,
         )
@@ -288,6 +329,7 @@ def _reload_step2_job(job_id: str, job_dir: Path, created: datetime) -> None:
             status="interrupted",
             message="Interrupted — resume available",
             step="step2",
+            taxonomy_id=taxonomy_id,
             created_at=created,
         )
 
@@ -699,6 +741,10 @@ def _configure_sector_classifier(job_dir: Path):
     sector_classifier.INPUT_SHEET = detected_sheet
     sector_classifier.CHECKPOINT_JSONL = str(job_dir / STEP2_CHECKPOINT)
     sector_classifier.OUTPUT_XLSX = str(job_dir / "output" / STEP2_OUTPUT)
+    # Select the classification scheme the same way the paths are set per job. The id
+    # is read from the job's on-disk marker (default sic_80200) so test/batch-submit/
+    # batch-results all use the same taxonomy, even after a server restart.
+    sector_classifier.TAXONOMY_ID = _step2_taxonomy_id(job_dir)
     # The module reads the key at import time from pipeline/.env; make sure it picks
     # up whatever the backend loaded from backend/.env.
     sector_classifier.ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -725,7 +771,7 @@ def _execute_step2_test(job_id: str) -> None:
             raise RuntimeError("test run finished but produced no classified workbook")
 
         job.output_path = output
-        job.summary = _step2_summary(output, "test")
+        job.summary = _step2_summary(output, "test", _step2_taxonomy_id(job_dir))
         job.status = "complete"
         job.message = "Complete"
         log.info("Step 2 test job %s complete → %s", job_id, output)
@@ -787,7 +833,7 @@ def _execute_step2_check(job_id: str) -> None:
         output = _find_step2_output(job_dir)
         if output is not None:
             job.output_path = output
-            job.summary = _step2_summary(output, "batch")
+            job.summary = _step2_summary(output, "batch", _step2_taxonomy_id(job_dir))
             job.status = "complete"
             job.message = "Complete"
             log.info("Step 2 batch job %s complete → %s", job_id, output)
@@ -872,9 +918,16 @@ def _execute_step3_pipeline(job_id: str) -> None:
         # main() calls sys.exit() on fatal input errors; SystemExit isn't an
         # Exception, so catch it explicitly to avoid leaving the job wedged.
         log.exception("Step 3 job %s failed", job_id)
-        job.status = "error"
         job.error = str(exc)
-        job.message = f"Error: {exc}"
+        # If the checkpoint survived (the TombaFatalError guardrails preserve it),
+        # the job is resumable — label it so the UI offers Resume instead of forcing
+        # a fresh, re-paid run. True input/config failures stay "error".
+        if (job_dir / STEP3_CHECKPOINT).exists():
+            job.status = "interrupted"
+            job.message = f"Interrupted — resume available (last error: {exc})"
+        else:
+            job.status = "error"
+            job.message = f"Error: {exc}"
     finally:
         os.chdir(prev_cwd)
 
@@ -1153,6 +1206,7 @@ async def run_step2(
     file: UploadFile = File(...),
     step1_job_id: str = Form(...),
     mode: str = Form(...),
+    taxonomy_id: str = Form(DEFAULT_TAXONOMY_ID),
 ):
     if _is_running():
         raise HTTPException(status_code=409, detail="Another job is currently running.")
@@ -1162,12 +1216,20 @@ async def run_step2(
     if not (file.filename or "").lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Please upload an .xlsx file.")
 
+    # Validate the requested taxonomy against the registry; unknown ids are rejected
+    # rather than silently classified with the default.
+    import taxonomies  # taxonomy registry (pipeline/taxonomies)
+    if taxonomy_id not in taxonomies.REGISTRY:
+        raise HTTPException(status_code=400, detail=f"Unknown taxonomy_id: {taxonomy_id}")
+
     job_id = str(uuid.uuid4())
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
     # Tag this job dir as a Step 2 job so it reloads correctly after a restart.
     (job_dir / STEP2_MARKER).write_text("step2", encoding="utf-8")
+    # Persist the chosen taxonomy so batch-results (possibly after a restart) reuses it.
+    (job_dir / STEP2_TAXONOMY).write_text(taxonomy_id, encoding="utf-8")
 
     input_path = job_dir / "input.xlsx"
     with input_path.open("wb") as out:
@@ -1184,10 +1246,11 @@ async def run_step2(
                  job_id, step1_job_id)
 
     jobs[job_id] = JobState(
-        job_id=job_id, status="queued", message="Queued", step="step2", mode=mode
+        job_id=job_id, status="queued", message="Queued", step="step2",
+        mode=mode, taxonomy_id=taxonomy_id,
     )
     _launch_step2(job_id, mode)
-    return {"job_id": job_id, "status": "queued", "mode": mode}
+    return {"job_id": job_id, "status": "queued", "mode": mode, "taxonomy_id": taxonomy_id}
 
 
 @app.post("/api/step2/check-results/{job_id}")
@@ -1218,6 +1281,7 @@ async def status_step2(job_id: str):
         "status": job.status,
         "message": job.message,
         "mode": job.mode,
+        "taxonomy_id": job.taxonomy_id,
         "batch_id": job.batch_id,
         "summary": job.summary,
     }
@@ -1245,6 +1309,7 @@ async def list_step2_jobs():
             "status": j.status,
             "message": j.message,
             "mode": j.mode,
+            "taxonomy_id": j.taxonomy_id,
             "batch_id": j.batch_id,
             "summary": j.summary,
             "created_at": j.created_at.isoformat(),
@@ -1252,6 +1317,18 @@ async def list_step2_jobs():
         for j in sorted(jobs.values(), key=lambda x: x.created_at, reverse=True)
         if j.step == "step2"
     ]
+
+
+# ── Taxonomies (read-only) — drives the Step 2 classification-scheme selector ─────
+
+
+@app.get("/taxonomies")
+async def get_taxonomies():
+    """List every registered classification scheme: id, human label, and the ordered
+    sector names it generates. The frontend renders its dropdowns from this so new
+    taxonomies appear automatically with no frontend edits."""
+    import taxonomies  # taxonomy registry (pipeline/taxonomies)
+    return taxonomies.list_taxonomies()
 
 
 # ── Step 3 (email finder) endpoints — prefix /api/step3/ ─────────────────────────
@@ -1269,12 +1346,30 @@ def _mark_missing_keys(job: JobState) -> None:
 
 
 @app.post("/api/step3/run")
-async def run_step3(file: UploadFile = File(...)):
+async def run_step3(file: UploadFile = File(...), force: bool = Form(False)):
     if _is_running():
         raise HTTPException(status_code=409, detail="Another job is currently running.")
 
     if not (file.filename or "").lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Please upload an .xlsx file.")
+
+    contents = await file.read()
+
+    # Close the accidental-restart trap: if an incomplete Step 3 job for this exact
+    # file already exists, return it instead of silently starting fresh (and re-paying
+    # for completed rows). The UI offers Resume, or re-runs with force=true.
+    if not force:
+        digest = hashlib.sha256(contents).hexdigest()
+        for d in sorted(JOBS_DIR.iterdir()):
+            if d.is_dir() and _is_resumable_step3(d):
+                if hashlib.sha256((d / "input.xlsx").read_bytes()).hexdigest() == digest:
+                    return {
+                        "status": "resumable",
+                        "resumable_job_id": d.name,
+                        "detail": "An incomplete job for this exact file already "
+                                  "exists. Resume it to avoid re-paying for completed "
+                                  "rows, or re-run with force=true.",
+                    }
 
     job_id = str(uuid.uuid4())
     job_dir = JOBS_DIR / job_id
@@ -1284,8 +1379,7 @@ async def run_step3(file: UploadFile = File(...)):
     (job_dir / STEP3_MARKER).write_text("step3", encoding="utf-8")
 
     input_path = job_dir / "input.xlsx"
-    with input_path.open("wb") as out:
-        shutil.copyfileobj(file.file, out)
+    input_path.write_bytes(contents)
 
     jobs[job_id] = JobState(job_id=job_id, status="queued", message="Queued", step="step3")
 
@@ -1356,6 +1450,7 @@ async def list_step3_jobs():
             "message": j.message,
             "summary": j.summary,
             "created_at": j.created_at.isoformat(),
+            "resumable": _is_resumable_step3(JOBS_DIR / j.job_id),
         }
         for j in sorted(jobs.values(), key=lambda x: x.created_at, reverse=True)
         if j.step == "step3"

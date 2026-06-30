@@ -51,6 +51,14 @@
       <div id="resume-list"></div>
     </section>
 
+    <!-- Resume by Job ID (fallback when the job isn't auto-listed) -->
+    <section id="manual-resume-section">
+      <h2>Resume by Job ID</h2>
+      <p class="cols-note">Continue a previous job from its checkpoint — no re-upload, no re-paying for completed rows.</p>
+      <input type="text" id="manual-job-id" placeholder="e.g. ec3edd97-aa6c-48b4-b045-c469a5c55d71" style="width:100%;margin-bottom:8px;" />
+      <button id="manual-resume-btn" type="button">Resume this job</button>
+    </section>
+
     <!-- Required columns -->
     <section id="required-cols-section">
       <h2>Required columns</h2>
@@ -150,7 +158,7 @@
         // Reconnect to a job that is still running (user navigated away / reloaded).
         maybeReconnect(jobs);
 
-        const resumable = jobs.filter((j) => j.status === "interrupted");
+        const resumable = jobs.filter((j) => j.resumable || j.status === "interrupted");
 
         els.resumeList.innerHTML = "";
         if (resumable.length === 0) {
@@ -233,6 +241,23 @@
           return;
         }
         const data = await res.json();
+        if (data.status === "resumable") {
+          if (confirm(`An incomplete job for this file already exists (${data.resumable_job_id}). Resume it instead of paying again for completed rows?`)) {
+            resumeJob(data.resumable_job_id);
+          } else if (confirm("Start a brand-new run and re-query every row? This spends credits.")) {
+            const f2 = new FormData();
+            f2.append("file", file);
+            f2.append("force", "true");
+            const r2 = await fetch(`${API_BASE}/api/step3/run`, {
+              method: "POST",
+              headers: { "ngrok-skip-browser-warning": "true" },
+              body: f2,
+            });
+            const d2 = await r2.json();
+            startTracking(d2.job_id);
+          }
+          return;
+        }
         startTracking(data.job_id);
       } catch (err) {
         els.uploadError.textContent = "Could not reach the server.";
@@ -338,6 +363,12 @@
     }
 
     // ── init ──────────────────────────────────────────────────────────────────────
+    els.manualResumeBtn = document.getElementById("manual-resume-btn");
+    els.manualJobId = document.getElementById("manual-job-id");
+    els.manualResumeBtn.addEventListener("click", () => {
+      const id = els.manualJobId.value.trim();
+      if (id) resumeJob(id);
+    });
     els.runBtn.addEventListener("click", runJob);
     loadJobs();
   </script>

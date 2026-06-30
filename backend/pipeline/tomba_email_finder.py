@@ -32,6 +32,7 @@ import os
 import sys
 import json
 import time
+import random
 import threading
 from collections import deque
 from urllib.parse import urlparse
@@ -62,6 +63,9 @@ COL_EMAIL = "Tomba_Email"
 COL_CONFIDENCE = "Tomba_Confidence"
 COL_VERIFICATION = "Tomba_Verification"
 COL_POSITION = "Tomba_Position"
+# Distinguishes outcome kinds: "ok" (email found), "no_email" (genuine miss),
+# "unreachable_5xx" (row gave up after repeated 5xx — NOT a real "no email").
+COL_LOOKUP_STATUS = "Tomba_Lookup_Status"
 
 # Tomba settings
 TOMBA_API_KEY = os.getenv("TOMBA_API_KEY")
@@ -111,6 +115,78 @@ class RateLimiter:
 limiter = RateLimiter(RATE_LIMIT_PER_MIN)
 
 
+# ── Fatal-error handling (guardrails — additive) ───────────────────────────
+class TombaFatalError(RuntimeError):
+    """An API-level failure: bad/expired key, no credits, persistent 5xx, or
+    429-retry exhaustion.
+
+    Raising this propagates out of the run so main() aborts WITHOUT writing the
+    output workbook and WITHOUT deleting the checkpoint — preserving resume state
+    and the evidence (mirrors the Step 2 guardrail). A genuine HTTP 200 that
+    returns an empty or personal-domain email is NOT fatal and still records a
+    normal miss.
+    """
+
+    def __init__(self, status, body):
+        self.status = status
+        self.body = body
+        super().__init__(
+            f"Tomba API failure (status={status}) — aborting run; output NOT "
+            f"written, checkpoint preserved for resume. Response: {str(body)[:500]}"
+        )
+
+
+# Set on the first fatal error so the other worker threads stop fast instead of
+# draining the whole remaining queue before the exception propagates.
+_ABORT = threading.Event()
+
+# R4 — in-run cache of identical (fname, sname, domain) lookups. ONLY successful
+# HTTP 200 results are ever stored here (see query_tomba), so a transient network
+# error or any fatal path can never be cached as a permanent miss.
+_result_cache: dict = {}
+_cache_lock = threading.Lock()
+
+# R5 — cap the 429/5xx retry instead of recursing unbounded.
+MAX_ATTEMPTS = 5
+
+# 5xx policy: a single unreachable row should NOT abort the run. Retry this many
+# times, then tag the row as an "unreachable_5xx" miss and move on.
+MAX_5XX_ATTEMPTS = 3
+
+# Outage guard: if this many rows in a row exhaust to unreachable_5xx with zero
+# successes in between, Tomba is effectively down — abort (checkpoint preserved)
+# rather than emit a falsely-complete output. Any HTTP 200 resets the counter.
+MAX_CONSECUTIVE_5XX = int(os.getenv("TOMBA_MAX_CONSECUTIVE_5XX", "10"))
+_consec_5xx = 0
+_consec_lock = threading.Lock()
+
+
+def _jittered(backoff: float) -> float:
+    """backoff ± 0.5×backoff random jitter, so parallel workers don't retry in
+    lockstep (thundering herd). Never returns a negative delay."""
+    return max(0.0, backoff + random.uniform(-0.5, 0.5) * backoff)
+
+
+def _retry_after_seconds(resp) -> float | None:
+    """Parse a 429 Retry-After header (integer seconds or HTTP-date) into seconds,
+    capped at 60s. Returns None if the header is absent or unparseable, so the
+    caller falls back to the existing exponential backoff."""
+    ra = resp.headers.get("Retry-After")
+    if not ra:
+        return None
+    ra = ra.strip()
+    if ra.isdigit():
+        return min(float(ra), 60.0)
+    try:
+        from email.utils import parsedate_to_datetime
+        import datetime as _dt
+        delta = (parsedate_to_datetime(ra)
+                 - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+        return max(0.0, min(delta, 60.0))
+    except Exception:
+        return None
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────
 def extract_domain(website: str) -> str:
     s = str(website).strip()
@@ -126,31 +202,57 @@ def extract_domain(website: str) -> str:
 
 
 def query_tomba(first_name: str, last_name: str, domain: str) -> dict:
+    global _consec_5xx
     empty = {
         "email": "", "confidence": "",
-        "verification": "", "position": ""
+        "verification": "", "position": "", "lookup_status": ""
     }
     if not (TOMBA_API_KEY and TOMBA_SECRET):
         return {**empty, "email": "NO_KEY"}
     if not all([domain, first_name, last_name]):
         return empty
 
-    limiter.acquire()
-    try:
-        r = requests.get(
-            "https://api.tomba.io/v1/email-finder",
-            headers={
-                "X-Tomba-Key": TOMBA_API_KEY,
-                "X-Tomba-Secret": TOMBA_SECRET,
-            },
-            params={
-                "domain": domain,
-                "first_name": first_name,
-                "last_name": last_name,
-            },
-            timeout=45,
-        )
+    # R4 — collapse identical lookups within this run. Only successful 200
+    # responses ever populate this cache (below), so a transient failure can
+    # never be stored as a permanent miss.
+    cache_key = (first_name, last_name, domain)
+    with _cache_lock:
+        if cache_key in _result_cache:
+            return _result_cache[cache_key]
+
+    backoff = 3
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        # If another worker already hit a fatal API error, stop fast and let the
+        # run abort. Raise (don't return a miss) so this row is never written to
+        # the checkpoint as a false miss.
+        if _ABORT.is_set():
+            raise TombaFatalError("aborted", "run aborted by an earlier API failure")
+
+        limiter.acquire()
+        try:
+            r = requests.get(
+                "https://api.tomba.io/v1/email-finder",
+                headers={
+                    "X-Tomba-Key": TOMBA_API_KEY,
+                    "X-Tomba-Secret": TOMBA_SECRET,
+                },
+                params={
+                    "domain": domain,
+                    "first_name": first_name,
+                    "last_name": last_name,
+                },
+                timeout=45,
+            )
+        except Exception as e:
+            # Network/timeout → genuine miss (unchanged behavior). NOT cached.
+            tqdm.write(f"  [error] {first_name} {last_name} @ {domain}: {e}")
+            return {**empty, "lookup_status": "no_email"}
+
         if r.status_code == 200:
+            # A reachable response → not an outage. Reset the consecutive-5xx guard.
+            with _consec_lock:
+                _consec_5xx = 0
+
             data = r.json().get("data", {}) or {}
             ver = data.get("verification", {}) or {}
 
@@ -165,22 +267,67 @@ def query_tomba(first_name: str, last_name: str, domain: str) -> dict:
             if email:
                 email_domain = email.split("@")[-1].lower() if "@" in email else ""
                 if email_domain in personal_domains:
-                    return empty  # discard personal email
+                    discarded = {**empty, "lookup_status": "no_email"}
+                    with _cache_lock:  # personal discard is a genuine 200 result
+                        _result_cache[cache_key] = discarded
+                    return discarded  # discard personal email
 
-            return {
+            result = {
                 "email": email,
                 "confidence": data.get("score", ""),
                 "verification": ver.get("status", "") if isinstance(ver, dict) else str(ver),
                 "position": data.get("position", "") or "",
+                "lookup_status": "ok" if email else "no_email",
             }
+            with _cache_lock:
+                _result_cache[cache_key] = result
+            return result
         elif r.status_code == 429:
-            time.sleep(3)
-            return query_tomba(first_name, last_name, domain)
+            # R5 — bounded retry with backoff instead of unbounded recursion.
+            if attempt == MAX_ATTEMPTS:
+                _ABORT.set()
+                raise TombaFatalError(
+                    429, f"rate-limited after {MAX_ATTEMPTS} attempts: {r.text}")
+            # Honour Tomba's Retry-After when present; else jittered exp. backoff.
+            retry_after = _retry_after_seconds(r)
+            time.sleep(retry_after if retry_after is not None else _jittered(backoff))
+            backoff *= 2
+            continue
+        elif r.status_code in (401, 402, 403):
+            # R1 — invalid/expired key or out of credits → fatal, abort the run.
+            _ABORT.set()
+            raise TombaFatalError(r.status_code, r.text)
+        elif 500 <= r.status_code < 600:
+            # Transient/gateway server error (incl. 502/503/504). Retry up to
+            # MAX_5XX_ATTEMPTS with jittered backoff. On exhaustion, do NOT abort —
+            # tag the row as an unreachable miss and continue, so one dead row can't
+            # halt the whole run. NOT cached (the row may be reachable on a later run).
+            if attempt < MAX_5XX_ATTEMPTS:
+                time.sleep(_jittered(backoff))
+                backoff *= 2
+                continue
+            tqdm.write(
+                f"  [unreachable] {first_name} {last_name} @ {domain}: "
+                f"{MAX_5XX_ATTEMPTS}× HTTP {r.status_code} — tagged unreachable_5xx")
+            # Outage guard: many consecutive rows failing with no success between
+            # means Tomba is down → abort (checkpoint preserved) rather than emit a
+            # falsely-complete output. Any HTTP 200 resets this counter (see above).
+            with _consec_lock:
+                _consec_5xx += 1
+                n = _consec_5xx
+            if n >= MAX_CONSECUTIVE_5XX:
+                _ABORT.set()
+                raise TombaFatalError(
+                    r.status_code,
+                    f"Tomba unreachable: {n} consecutive rows exhausted to 5xx "
+                    f"(HTTP {r.status_code}) with no success in between — likely "
+                    f"outage, aborting.")
+            return {**empty, "lookup_status": "unreachable_5xx"}
         else:
-            return empty
-    except Exception as e:
-        tqdm.write(f"  [error] {first_name} {last_name} @ {domain}: {e}")
-        return empty
+            # Other non-200 (e.g. 400/404) → miss (unchanged behavior). NOT cached.
+            return {**empty, "lookup_status": "no_email"}
+
+    return empty  # defensive — the loop always returns or raises above
 
 
 # ── Per-sheet enrichment ───────────────────────────────────────────────────
@@ -192,10 +339,16 @@ def enrich_sheet(df: pd.DataFrame, sheet_name: str,
     missing = [c for c in (COL_FNAME, COL_SNAME, COL_WEBSITE) if c not in df.columns]
     if missing:
         print(f"  [{sheet_name}] WARNING: missing columns {missing} — skipping sheet.")
+        # R7 — still add the output columns so main()'s writer can't KeyError on
+        # COL_EMAIL. No rows are queried; the sheet just passes through empty.
+        for col in (COL_EMAIL, COL_CONFIDENCE, COL_VERIFICATION, COL_POSITION,
+                    COL_LOOKUP_STATUS):
+            df[col] = ""
         return df
 
     # Initialise output columns
-    for col in (COL_EMAIL, COL_CONFIDENCE, COL_VERIFICATION, COL_POSITION):
+    for col in (COL_EMAIL, COL_CONFIDENCE, COL_VERIFICATION, COL_POSITION,
+                COL_LOOKUP_STATUS):
         df[col] = ""
 
     # Load cached results for this sheet from checkpoint
@@ -211,6 +364,7 @@ def enrich_sheet(df: pd.DataFrame, sheet_name: str,
                 df.at[idx_int, COL_CONFIDENCE] = str(res.get("confidence", ""))
                 df.at[idx_int, COL_VERIFICATION] = str(res.get("verification", ""))
                 df.at[idx_int, COL_POSITION] = str(res.get("position", ""))
+            df.at[idx_int, COL_LOOKUP_STATUS] = str(res.get("lookup_status", ""))
         except Exception:
             pass
 
@@ -253,55 +407,62 @@ def enrich_sheet(df: pd.DataFrame, sheet_name: str,
     hits, misses, completed = 0, 0, 0
     start = time.time()
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {
-            ex.submit(query_tomba, f, s, d): idx
-            for idx, f, s, d in tasks
-        }
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {
+                ex.submit(query_tomba, f, s, d): idx
+                for idx, f, s, d in tasks
+            }
 
-        with tqdm(total=len(tasks), desc=f"  [{sheet_name}]", unit="contact") as pbar:
-            for fut in as_completed(futures):
-                idx = futures[fut]
-                res = fut.result()
+            with tqdm(total=len(tasks), desc=f"  [{sheet_name}]", unit="contact") as pbar:
+                for fut in as_completed(futures):
+                    idx = futures[fut]
+                    res = fut.result()
 
-                if res["email"] and res["email"] != "NO_KEY":
-                    df.at[idx, COL_EMAIL] = str(res["email"])
-                    df.at[idx, COL_CONFIDENCE] = str(res["confidence"])
-                    df.at[idx, COL_VERIFICATION] = str(res["verification"])
-                    df.at[idx, COL_POSITION] = str(res["position"])
-                    hits += 1
-                else:
-                    misses += 1
+                    if res["email"] and res["email"] != "NO_KEY":
+                        df.at[idx, COL_EMAIL] = str(res["email"])
+                        df.at[idx, COL_CONFIDENCE] = str(res["confidence"])
+                        df.at[idx, COL_VERIFICATION] = str(res["verification"])
+                        df.at[idx, COL_POSITION] = str(res["position"])
+                        hits += 1
+                    else:
+                        misses += 1
 
-                # Persist this row's result to checkpoint dict
-                sheet_cp[str(idx)] = {
-                    "email": res.get("email", "") if res.get("email") != "NO_KEY" else "",
-                    "confidence": res.get("confidence", ""),
-                    "verification": res.get("verification", ""),
-                    "position": res.get("position", ""),
-                }
-                checkpoint[sheet_name] = sheet_cp
+                    df.at[idx, COL_LOOKUP_STATUS] = str(res.get("lookup_status", ""))
 
-                completed += 1
-                pbar.update(1)
-                rpm = completed / max(time.time() - start, 0.1) * 60
-                pbar.set_postfix(hits=hits, misses=misses, rpm=f"{rpm:.0f}")
+                    # Persist this row's result to checkpoint dict
+                    sheet_cp[str(idx)] = {
+                        "email": res.get("email", "") if res.get("email") != "NO_KEY" else "",
+                        "confidence": res.get("confidence", ""),
+                        "verification": res.get("verification", ""),
+                        "position": res.get("position", ""),
+                        "lookup_status": res.get("lookup_status", ""),
+                    }
+                    checkpoint[sheet_name] = sheet_cp
 
-                # Report per-row progress to the caller (web backend), if asked.
-                if progress_cb is not None:
-                    f, s, d = task_meta.get(idx, ("", "", ""))
-                    progress_cb(completed, len(tasks), f"{f} {s} @ {d}")
+                    completed += 1
+                    pbar.update(1)
+                    rpm = completed / max(time.time() - start, 0.1) * 60
+                    pbar.set_postfix(hits=hits, misses=misses, rpm=f"{rpm:.0f}")
 
-                # Persist checkpoint to disk every N rows
-                if completed % CHECKPOINT_EVERY == 0:
-                    save_checkpoint(checkpoint)
-                    tqdm.write(
-                        f"  [{sheet_name}] checkpoint saved @ {completed} — "
-                        f"{hits} hits / {misses} misses"
-                    )
+                    # Report per-row progress to the caller (web backend), if asked.
+                    if progress_cb is not None:
+                        f, s, d = task_meta.get(idx, ("", "", ""))
+                        progress_cb(completed, len(tasks), f"{f} {s} @ {d}")
 
-    # Final checkpoint save for this sheet
-    save_checkpoint(checkpoint)
+                    # Persist checkpoint to disk every N rows
+                    if completed % CHECKPOINT_EVERY == 0:
+                        save_checkpoint(checkpoint)
+                        tqdm.write(
+                            f"  [{sheet_name}] checkpoint saved @ {completed} — "
+                            f"{hits} hits / {misses} misses"
+                        )
+    finally:
+        # Flush every harvested-but-unsaved row (up to CHECKPOINT_EVERY-1) before any
+        # exception propagates — so an abort never discards a paid-for result. This
+        # only persists already-collected results; it does not touch the abort or
+        # propagation logic (fut.result() still re-raises out of this block).
+        save_checkpoint(checkpoint)
 
     elapsed = time.time() - start
     print(

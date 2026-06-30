@@ -25,6 +25,22 @@
       font-size: 14px;
       margin-bottom: 16px;
     }
+    /* Taxonomy selector — multi-select + read-only "will generate" sector list */
+    select[multiple] {
+      padding: 8px 10px;
+      height: auto;
+    }
+    .scheme-sectors {
+      margin: -8px 0 16px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .scheme-sectors .scheme-sectors-label { font-weight: 600; color: var(--text); }
+    .scheme-sectors ol {
+      margin: 6px 0 0;
+      padding-left: 20px;
+      line-height: 1.6;
+    }
     .button-row { display: flex; gap: 10px; flex-wrap: wrap; }
     .button-row button.secondary {
       background: var(--card);
@@ -115,6 +131,17 @@
       <label class="field-label" for="step1-select">Select Step 1 job</label>
       <select id="step1-select"></select>
 
+      <label class="field-label" for="taxonomy-select">Classification scheme</label>
+      <select id="taxonomy-select"></select>
+      <div id="scheme-sectors" class="scheme-sectors"></div>
+
+      <label class="field-label" for="export-select">Sectors to export</label>
+      <select id="export-select" multiple size="6"></select>
+      <p class="cols-note">
+        Hold ⌘/Ctrl to multi-select. All sectors are selected by default.
+        Filtering is presentational for now — every sector sheet is still written.
+      </p>
+
       <label class="field-label" for="file-input">Upload promoted .xlsx from Step 1</label>
       <label class="file-field">
         <input type="file" id="file-input" accept=".xlsx" />
@@ -162,6 +189,9 @@
       existingSection: document.getElementById("existing-section"),
       existingList: document.getElementById("existing-list"),
       step1Select: document.getElementById("step1-select"),
+      taxonomySelect: document.getElementById("taxonomy-select"),
+      schemeSectors: document.getElementById("scheme-sectors"),
+      exportSelect: document.getElementById("export-select"),
       fileInput: document.getElementById("file-input"),
       testBtn: document.getElementById("test-btn"),
       batchBtn: document.getElementById("batch-btn"),
@@ -180,6 +210,7 @@
 
     let pollTimer = null;
     let currentJobId = null;
+    let taxonomies = [];  // [{id, label, sectors:[...]}] from GET /taxonomies
 
     // ── helpers ───────────────────────────────────────────────────────────────
     function show(el) { el.classList.remove("hidden"); }
@@ -229,6 +260,56 @@
       } catch (err) {
         console.error("Failed to load Step 1 jobs:", err);
       }
+    }
+
+    // ── taxonomy selector (driven entirely by GET /taxonomies) ──────────────────
+    // New schemes added server-side appear here automatically — no frontend edits.
+    async function loadTaxonomies() {
+      try {
+        const res = await fetch(`${API_BASE}/taxonomies`, {
+          headers: { "ngrok-skip-browser-warning": "true" },
+        });
+        if (!res.ok) return;
+        taxonomies = await res.json();
+        els.taxonomySelect.innerHTML = "";
+        taxonomies.forEach((t) => {
+          const opt = document.createElement("option");
+          opt.value = t.id;
+          opt.textContent = t.label;
+          els.taxonomySelect.appendChild(opt);
+        });
+        renderScheme();  // render sector list + export options for the first scheme
+      } catch (err) {
+        console.error("Failed to load taxonomies:", err);
+      }
+    }
+
+    function selectedTaxonomy() {
+      return taxonomies.find((t) => t.id === els.taxonomySelect.value) || taxonomies[0];
+    }
+
+    // Render the read-only "this scheme will generate" list (Dropdown A) and populate
+    // the multi-select export list (Dropdown B), with every sector selected by default.
+    function renderScheme() {
+      const tax = selectedTaxonomy();
+      const sectors = (tax && tax.sectors) || [];
+
+      els.schemeSectors.innerHTML =
+        `<span class="scheme-sectors-label">This scheme will generate ${sectors.length} sectors:</span>` +
+        `<ol>${sectors.map((s) => `<li>${s}</li>`).join("")}</ol>`;
+
+      els.exportSelect.innerHTML = "";
+      sectors.forEach((s) => {
+        const opt = document.createElement("option");
+        opt.value = s;
+        opt.textContent = s;
+        opt.selected = true;  // default = all selected
+        els.exportSelect.appendChild(opt);
+      });
+    }
+
+    function selectedExportSectors() {
+      return Array.from(els.exportSelect.selectedOptions).map((o) => o.value);
     }
 
     // ── existing Step 2 jobs ────────────────────────────────────────────────────
@@ -344,10 +425,15 @@
         return;
       }
 
+      const tax = selectedTaxonomy();
       const form = new FormData();
       form.append("file", file);
       form.append("step1_job_id", step1JobId);
       form.append("mode", mode);
+      form.append("taxonomy_id", tax ? tax.id : "sic_80200");
+      // TODO: backend does not yet filter output sheets by selected sectors — this is
+      // sent for forward-compatibility but every sector sheet is still written.
+      form.append("export_sectors", JSON.stringify(selectedExportSectors()));
 
       els.testBtn.disabled = true;
       els.batchBtn.disabled = true;
@@ -490,15 +576,27 @@
         ? `TEST MODE — ${n(summary.rows_classified)} rows classified`
         : `FULL BATCH — ${n(summary.rows_classified)} rows classified`;
 
+      // Prefer the taxonomy-driven by_sector tally (works for any scheme, in the
+      // scheme's own order). Fall back to the legacy fixed 80200 rows if absent.
+      let rows;
+      if (summary.by_sector && typeof summary.by_sector === "object") {
+        rows = Object.entries(summary.by_sector)
+          .map(([sector, count]) => `<tr><td>${sector}</td><td>${n(count)}</td></tr>`)
+          .join("");
+      } else {
+        rows =
+          `<tr><td>Security</td><td>${n(summary.security)}</td></tr>` +
+          `<tr><td>MSP V</td><td>${n(summary.msp)}</td></tr>` +
+          `<tr><td>Integration</td><td>${n(summary.integration)}</td></tr>` +
+          `<tr><td>Support</td><td>${n(summary.support)}</td></tr>` +
+          `<tr><td>Infrastructure</td><td>${n(summary.infrastructure)}</td></tr>` +
+          `<tr><td>Other</td><td>${n(summary.other)}</td></tr>`;
+      }
+
       els.summaryCard.innerHTML = `
         <h3>${heading}</h3>
         <table class="summary-table">
-          <tr><td>Security</td><td>${n(summary.security)}</td></tr>
-          <tr><td>MSP V</td><td>${n(summary.msp)}</td></tr>
-          <tr><td>Integration</td><td>${n(summary.integration)}</td></tr>
-          <tr><td>Support</td><td>${n(summary.support)}</td></tr>
-          <tr><td>Infrastructure</td><td>${n(summary.infrastructure)}</td></tr>
-          <tr><td>Other</td><td>${n(summary.other)}</td></tr>
+          ${rows}
           <tr class="total-row"><td>Total</td><td>${n(summary.rows_classified)}</td></tr>
         </table>
       `;
@@ -509,6 +607,8 @@
     els.testBtn.addEventListener("click", () => runJob("test"));
     els.batchBtn.addEventListener("click", () => runJob("batch"));
     els.checkBtn.addEventListener("click", checkResults);
+    els.taxonomySelect.addEventListener("change", renderScheme);
+    loadTaxonomies();
     loadStep1Jobs();
     loadStep2Jobs();
   </script>

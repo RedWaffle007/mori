@@ -35,6 +35,8 @@ import pandas as pd
 from dotenv import load_dotenv
 import os
 
+from taxonomies import get_taxonomy  # taxonomy registry (taxonomies/__init__.py)
+
 load_dotenv(Path(__file__).resolve().parent / ".env")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
@@ -50,7 +52,7 @@ BATCH_REQUESTS_FILE = "batch_requests.jsonl"
 BATCH_ID_FILE = "batch_id.txt"
 BATCH_IDX_MAP_FILE = "batch_idx_mapping.json"
 
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096
 BATCH_SIZE = 150
 CONCURRENCY = 5
@@ -58,108 +60,124 @@ MAX_RETRIES = 4
 BASE_RETRY_DELAY = 5
 SG_CONTENT_CAP = 3000
 
-SECTOR_DEFINITIONS = """
-You are a company sector classifier. Classify each company into exactly one sector
-using all available signals: business name, website URL, page title, and website content.
-Website content may be absent for some rows — use the other signals in that case.
+# Which taxonomy this run uses. main.py sets this per job exactly the way it sets
+# INPUT_XLSX / OUTPUT_XLSX etc. Default "sic_80200" → existing jobs are unchanged.
+TAXONOMY_ID = "sic_80200"
 
-SECTOR 1: "Security"
-Core keywords: cybersecurity, SOC, MDR, endpoint protection, IDS/IPS,
-identity & access management, IAM, SSO, MFA, encryption, key management,
-VPN, secure access, compliance, PCI DSS, HIPAA, ISO 27001, SOC 2, GDPR,
-vulnerability management, penetration testing, risk assessment,
-logging & SIEM, forensic analysis, threat intelligence
-Services & Capabilities: managed security, MSSP, security operations,
-SOC-as-a-service, MDR, managed detection and response, endpoint protection,
-EDR, XDR, managed firewall, threat hunting, SIEM, log management,
-security monitoring, 24/7 monitoring, incident response, cyber incident,
-breach response, vulnerability management, penetration testing, pen testing,
-identity management, IAM, privileged access, MFA, SSO, zero trust
-Certifications & Compliance: ISO 27001, SOC 2, Cyber Essentials, CREST,
-PCI DSS, security accredited, certified security provider
 
-SECTOR 2: "MSP V"
-Vertical signals (weight these highly):
-- Financial Services: fintech IT, financial services IT, FCA compliant,
-  PCI DSS, banking IT, wealth management IT, insurance IT
-- Healthcare: healthcare IT, NHS IT, clinical systems, HIPAA, health data,
-  medical IT, GP surgery IT, pharmacy IT
-- Legal: legal IT, law firm IT, SRA compliant, legal sector technology,
-  chambers IT
-- Defence / Government: MOD supplier, government IT, public sector IT,
-  SC cleared, DV cleared, Cyber Essentials Plus, G-Cloud, Crown Commercial
-- Professional Services: accountancy IT, property IT, real estate technology,
-  recruitment IT
-Recurring Revenue & Contract Signals: managed services contract, MRR,
-monthly recurring, SLA-backed, per-seat pricing, per-user,
-subscription-based, retained IT, outsourced IT department, IT partner
-Toolstack signals: ConnectWise, Datto, Kaseya, Autotask, Halo PSA,
-NinjaRMM, SolarWinds, N-able, RMM, PSA, remote monitoring and management,
-professional services automation, automated remediation, self-healing,
-AIOps, automation-first, custom platform, proprietary tooling
-Maturity signals: infrastructure as code, Terraform, Ansible, DevOps,
-CI/CD, cloud-native, containerised, Kubernetes, API-first,
-integration platform, middleware
+def _active_taxonomy():
+    """The taxonomy module for the current TAXONOMY_ID (resolved at call time so a
+    per-job override of TAXONOMY_ID is always honoured)."""
+    return get_taxonomy(TAXONOMY_ID)
 
-SECTOR 3: "Integration"
-Keywords: systems integration, IT consulting, enterprise architecture,
-application migration, cloud migration, replatforming, lift-and-shift,
-API integration, middleware, ESB, microservices, DevOps, CI/CD, automation,
-Infrastructure as Code, Terraform, Ansible, container orchestration,
-Kubernetes, Docker, service mesh, platform engineering, cloud-native,
-serverless, disaster recovery, business continuity, backup & replication,
-RTO, RPO
 
-SECTOR 4: "Support"
-Keywords: hardware maintenance, onsite support, break/fix, depot repair,
-lifecycle management, asset disposition, e-waste, spare parts,
-warranty services, SLAs, ticketing, incident management, NOC,
-remote monitoring, 24/7 monitoring, fault management, managed support,
-helpdesk, tier 1/2/3 support, technical support, IT outsourcing,
-staff augmentation, managed staff, vendor management, monitoring tools,
-SNMP, Prometheus, Datadog, Nagios, break/fix, time and materials,
-ad hoc support, hardware reseller, VAR, value-added reseller, box shifter,
-printer support, CCTV, physical security, helpdesk only, first line support,
-service desk outsourcing, hardware maintenance, depot repair, warranty services
-Note: helpdesk-only or hardware-only without broader managed services
-belongs here, NOT in MSP V.
-
-SECTOR 5: "Infrastructure"
-Keywords: data center, colocation, hyperscale, Tier III, facility management,
-cloud infrastructure, IaaS, PaaS, private cloud, hybrid cloud, multi-cloud,
-hosted servers, managed hosting, dedicated hosting, VPS, virtualization,
-bare metal, metal-as-a-service, edge computing, CDN, content delivery,
-edge nodes, power & cooling, UPS, redundancy, high-availability,
-network backbone, fiber, peering, interconnect, cross-connect
-
-SECTOR 6: "Other"
-Anything that does not clearly fit the five sectors above.
-
-Classification rules:
-- Cluster signals: companies mentioning at least two of [SOC, MDR, SIEM,
-  endpoint, zero trust] alongside [recurring, SLA, contract] → Security or MSP V
-- Weight vertical signals highly: "IT partner to law firms" or
-  "healthcare-focused MSP V" is a stronger indicator than a generic claim
-- Certification mentions (ISO 27001, SOC 2, Cyber Essentials Plus, CREST,
-  G-Cloud) are strong maturity proxies — factor into Security and MSP V
-- Helpdesk-only or hardware-only without broader managed services → Support, not MSP V
-
-Rules:
-- Return ONLY a JSON array, no explanation, no markdown, no code fences.
-- Each element: {"index": <original_index>, "sector": "<sector_name>"}
-- Sector must be exactly one of: "Security", "MSP V", "Integration",
-"Support", "Infrastructure", "Other"
-- Do not add any text before or after the JSON array.
-"""
-
-SECTORS_ORDER = [
-    "Security",
-    "MSP V",
-    "Integration",
-    "Support",
-    "Infrastructure",
-    "Other",
-]
+# removed: SECTOR_DEFINITIONS / SECTORS_ORDER are no longer hard-coded here — they
+# now come from the active taxonomy (taxonomies/sic_80200.py holds the identical
+# 80200 prompt + sector list). The original block is preserved, commented, below so
+# the engine carries no hard-coded taxonomy or "Other" yet the logic stays visible.
+#
+# SECTOR_DEFINITIONS = """
+# You are a company sector classifier. Classify each company into exactly one sector
+# using all available signals: business name, website URL, page title, and website content.
+# Website content may be absent for some rows — use the other signals in that case.
+#
+# SECTOR 1: "Security"
+# Core keywords: cybersecurity, SOC, MDR, endpoint protection, IDS/IPS,
+# identity & access management, IAM, SSO, MFA, encryption, key management,
+# VPN, secure access, compliance, PCI DSS, HIPAA, ISO 27001, SOC 2, GDPR,
+# vulnerability management, penetration testing, risk assessment,
+# logging & SIEM, forensic analysis, threat intelligence
+# Services & Capabilities: managed security, MSSP, security operations,
+# SOC-as-a-service, MDR, managed detection and response, endpoint protection,
+# EDR, XDR, managed firewall, threat hunting, SIEM, log management,
+# security monitoring, 24/7 monitoring, incident response, cyber incident,
+# breach response, vulnerability management, penetration testing, pen testing,
+# identity management, IAM, privileged access, MFA, SSO, zero trust
+# Certifications & Compliance: ISO 27001, SOC 2, Cyber Essentials, CREST,
+# PCI DSS, security accredited, certified security provider
+#
+# SECTOR 2: "MSP V"
+# Vertical signals (weight these highly):
+# - Financial Services: fintech IT, financial services IT, FCA compliant,
+#   PCI DSS, banking IT, wealth management IT, insurance IT
+# - Healthcare: healthcare IT, NHS IT, clinical systems, HIPAA, health data,
+#   medical IT, GP surgery IT, pharmacy IT
+# - Legal: legal IT, law firm IT, SRA compliant, legal sector technology,
+#   chambers IT
+# - Defence / Government: MOD supplier, government IT, public sector IT,
+#   SC cleared, DV cleared, Cyber Essentials Plus, G-Cloud, Crown Commercial
+# - Professional Services: accountancy IT, property IT, real estate technology,
+#   recruitment IT
+# Recurring Revenue & Contract Signals: managed services contract, MRR,
+# monthly recurring, SLA-backed, per-seat pricing, per-user,
+# subscription-based, retained IT, outsourced IT department, IT partner
+# Toolstack signals: ConnectWise, Datto, Kaseya, Autotask, Halo PSA,
+# NinjaRMM, SolarWinds, N-able, RMM, PSA, remote monitoring and management,
+# professional services automation, automated remediation, self-healing,
+# AIOps, automation-first, custom platform, proprietary tooling
+# Maturity signals: infrastructure as code, Terraform, Ansible, DevOps,
+# CI/CD, cloud-native, containerised, Kubernetes, API-first,
+# integration platform, middleware
+#
+# SECTOR 3: "Integration"
+# Keywords: systems integration, IT consulting, enterprise architecture,
+# application migration, cloud migration, replatforming, lift-and-shift,
+# API integration, middleware, ESB, microservices, DevOps, CI/CD, automation,
+# Infrastructure as Code, Terraform, Ansible, container orchestration,
+# Kubernetes, Docker, service mesh, platform engineering, cloud-native,
+# serverless, disaster recovery, business continuity, backup & replication,
+# RTO, RPO
+#
+# SECTOR 4: "Support"
+# Keywords: hardware maintenance, onsite support, break/fix, depot repair,
+# lifecycle management, asset disposition, e-waste, spare parts,
+# warranty services, SLAs, ticketing, incident management, NOC,
+# remote monitoring, 24/7 monitoring, fault management, managed support,
+# helpdesk, tier 1/2/3 support, technical support, IT outsourcing,
+# staff augmentation, managed staff, vendor management, monitoring tools,
+# SNMP, Prometheus, Datadog, Nagios, break/fix, time and materials,
+# ad hoc support, hardware reseller, VAR, value-added reseller, box shifter,
+# printer support, CCTV, physical security, helpdesk only, first line support,
+# service desk outsourcing, hardware maintenance, depot repair, warranty services
+# Note: helpdesk-only or hardware-only without broader managed services
+# belongs here, NOT in MSP V.
+#
+# SECTOR 5: "Infrastructure"
+# Keywords: data center, colocation, hyperscale, Tier III, facility management,
+# cloud infrastructure, IaaS, PaaS, private cloud, hybrid cloud, multi-cloud,
+# hosted servers, managed hosting, dedicated hosting, VPS, virtualization,
+# bare metal, metal-as-a-service, edge computing, CDN, content delivery,
+# edge nodes, power & cooling, UPS, redundancy, high-availability,
+# network backbone, fiber, peering, interconnect, cross-connect
+#
+# SECTOR 6: "Other"
+# Anything that does not clearly fit the five sectors above.
+#
+# Classification rules:
+# - Cluster signals: companies mentioning at least two of [SOC, MDR, SIEM,
+#   endpoint, zero trust] alongside [recurring, SLA, contract] → Security or MSP V
+# - Weight vertical signals highly: "IT partner to law firms" or
+#   "healthcare-focused MSP V" is a stronger indicator than a generic claim
+# - Certification mentions (ISO 27001, SOC 2, Cyber Essentials Plus, CREST,
+#   G-Cloud) are strong maturity proxies — factor into Security and MSP V
+# - Helpdesk-only or hardware-only without broader managed services → Support, not MSP V
+#
+# Rules:
+# - Return ONLY a JSON array, no explanation, no markdown, no code fences.
+# - Each element: {"index": <original_index>, "sector": "<sector_name>"}
+# - Sector must be exactly one of: "Security", "MSP V", "Integration",
+# "Support", "Infrastructure", "Other"
+# - Do not add any text before or after the JSON array.
+# """
+#
+# SECTORS_ORDER = [
+#     "Security",
+#     "MSP V",
+#     "Integration",
+#     "Support",
+#     "Infrastructure",
+#     "Other",
+# ]
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 
@@ -234,7 +252,8 @@ async def classify_batch_live(
     payload = {
         "model": CLAUDE_MODEL,
         "max_tokens": MAX_TOKENS,
-        "system": SECTOR_DEFINITIONS,
+        # removed: "system": SECTOR_DEFINITIONS — now the active taxonomy's prompt
+        "system": _active_taxonomy().SECTOR_DEFINITIONS,
         "messages": [{"role": "user", "content": build_prompt(batch_df)}],
     }
     headers = {
@@ -272,7 +291,8 @@ async def classify_batch_live(
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 print(f"  Network error attempt {attempt}: {e}")
                 await asyncio.sleep(BASE_RETRY_DELAY * (2 ** (attempt - 1)))
-        return {idx: "Other" for idx in batch_df.index}
+        # removed: {idx: "Other" ...} — fallback now comes from taxonomy.FALLBACK_SECTOR
+        return {idx: _active_taxonomy().FALLBACK_SECTOR for idx in batch_df.index}
 
 
 async def run_live(df: pd.DataFrame) -> dict:
@@ -309,7 +329,8 @@ def submit_batch(df: pd.DataFrame):
             "params": {
                 "model": CLAUDE_MODEL,
                 "max_tokens": MAX_TOKENS,
-                "system": SECTOR_DEFINITIONS,
+                # removed: "system": SECTOR_DEFINITIONS — now the active taxonomy's prompt
+                "system": _active_taxonomy().SECTOR_DEFINITIONS,
                 "messages": [{"role": "user", "content": build_prompt(batch_df)}],
             },
         })
@@ -388,12 +409,16 @@ def poll_and_download_batch(df: pd.DataFrame):
 
     idx_mapping = json.load(open(BATCH_IDX_MAP_FILE))
     sector_map = {}
+    status_counts = {}      # result-type → count, across every request
+    failed = []             # per-request failure detail (errored/canceled/expired)
 
     for line in results_raw.strip().splitlines():
         result = json.loads(line)
         custom_id = result["custom_id"]
         idx_list = idx_mapping.get(custom_id, [])
-        if result.get("result", {}).get("type") == "succeeded":
+        result_type = result.get("result", {}).get("type")
+        status_counts[result_type] = status_counts.get(result_type, 0) + 1
+        if result_type == "succeeded":
             raw = result["result"]["message"]["content"][0]["text"].strip()
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
@@ -407,10 +432,38 @@ def poll_and_download_batch(df: pd.DataFrame):
                         sector_map[idx_list[local_i]] = item["sector"]
             except (json.JSONDecodeError, KeyError):
                 for idx in idx_list:
-                    sector_map[idx] = "Other"
+                    # removed: sector_map[idx] = "Other" — now taxonomy.FALLBACK_SECTOR
+                    sector_map[idx] = _active_taxonomy().FALLBACK_SECTOR
         else:
-            for idx in idx_list:
-                sector_map[idx] = "Other"
+            # A non-succeeded request is an API-level failure, NOT a real
+            # classification. Capture its error type+message instead of
+            # silently writing every row as "Other".
+            err = result.get("result", {}).get("error", {})
+            inner = err.get("error", err) if isinstance(err, dict) else {}
+            failed.append({
+                "custom_id": custom_id,
+                "type": (inner or {}).get("type", result_type or "unknown"),
+                "message": (inner or {}).get("message", ""),
+            })
+
+    total = sum(status_counts.values())
+    succeeded = status_counts.get("succeeded", 0)
+    print(f"Batch result summary: total={total} succeeded={succeeded} "
+          f"failed={len(failed)} | by_type={status_counts}")
+
+    if failed:
+        # Distinct error types make a systemic cause (e.g. a bad model ID
+        # erroring every request) obvious at a glance.
+        type_breakdown = {}
+        for d in failed:
+            type_breakdown[d["type"]] = type_breakdown.get(d["type"], 0) + 1
+        first = failed[0]
+        raise RuntimeError(
+            f"Batch {batch_id} failed: {len(failed)}/{total} request(s) did not "
+            f"succeed — refusing to write output. "
+            f"First error [{first['type']}]: {first['message']}. "
+            f"Error-type breakdown: {type_breakdown}"
+        )
 
     print(f"Parsed {len(sector_map):,} classified rows")
     write_output(df, sector_map)
@@ -423,17 +476,27 @@ INTERNAL_COLS = ["_title", "_sg_content"]
 def write_output(df: pd.DataFrame, sector_map: dict, output_path: str | None = None):
     output_path = output_path or OUTPUT_XLSX
 
+    tax = _active_taxonomy()
+
     df = df.copy()
-    df["Sector"] = df.index.map(lambda i: sector_map.get(i, "Other"))
+    # removed: sector_map.get(i, "Other") — fallback now taxonomy.FALLBACK_SECTOR
+    df["Sector"] = df.index.map(lambda i: sector_map.get(i, tax.FALLBACK_SECTOR))
     df = df.drop(columns=INTERNAL_COLS, errors="ignore")
 
+    # removed: hard-coded sheets dict — now built from the active taxonomy's SHEET_MAP
+    # (sheet_name -> Sector value). For 80200 this reproduces the original six sheets
+    # ("security"->Security ... "other"->Other) exactly.
+    # sheets = {
+    #     "security": df[df["Sector"] == "Security"],
+    #     "MSP V": df[df["Sector"] == "MSP V"],
+    #     "integration": df[df["Sector"] == "Integration"],
+    #     "support": df[df["Sector"] == "Support"],
+    #     "infrastructure": df[df["Sector"] == "Infrastructure"],
+    #     "other": df[df["Sector"] == "Other"],
+    # }
     sheets = {
-        "security": df[df["Sector"] == "Security"],
-        "MSP V": df[df["Sector"] == "MSP V"],
-        "integration": df[df["Sector"] == "Integration"],
-        "support": df[df["Sector"] == "Support"],
-        "infrastructure": df[df["Sector"] == "Infrastructure"],
-        "other": df[df["Sector"] == "Other"],
+        sheet_name: df[df["Sector"] == sector]
+        for sheet_name, sector in tax.SHEET_MAP.items()
     }
 
     # Make sure the destination directory exists before writing.
